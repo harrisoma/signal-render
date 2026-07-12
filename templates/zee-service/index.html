@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zee Service Card</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400;1,500&family=Jost:wght@300;400;500;600&display=swap');
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:1080px; height:1080px; overflow:hidden; }
+  body { font-family:'Jost',system-ui,sans-serif; }
+
+  :root{
+    --cream:#F7F3EE;
+    --lav:#B79CE0;
+    --lav-deep:#6E4FA0;      /* deeper, richer lavender */
+    --lav-rich:#6E579E;      /* darkest accent — dusty */
+    --ink:#2A2530;
+    --muted:#9B93A3;
+    --line:#E6DFF2;
+    --card:#FFFFFF;
+  }
+
+  .canvas{ position:relative; width:1080px; height:1080px; background:var(--cream); overflow:hidden; }
+
+  /* richer lavender band across the top third — gives this card more presence */
+  .band{ position:absolute; top:0; left:0; right:0; height:44%;
+    background:linear-gradient(160deg, #9E86C4 0%, #6E579E 100%); }
+  .band::after{ content:""; position:absolute; inset:0;
+    background:radial-gradient(circle at 78% 30%, rgba(255,255,255,0.14) 0%, transparent 55%); }
+
+  /* soft botanical glow bottom */
+  .flourish{ position:absolute; bottom:-160px; left:-140px; width:440px; height:440px; border-radius:50%;
+    background:radial-gradient(circle, rgba(183,156,224,0.30) 0%, transparent 70%); filter:blur(20px); }
+
+  .inner{ position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; text-align:center; }
+
+  /* logo on the lavender band (bare — logo is transparent; on deep lavender it reads) */
+  .logo-wrap{ margin-top:70px; display:inline-flex; align-items:center; justify-content:center; }
+  .logo-wrap img{ height:78px; width:auto; display:block; }
+  .logo-wrap.pill{ background:#FFFFFF; border-radius:16px; padding:12px 18px; }
+  .wordmark{ font-family:'Cormorant Garamond',serif; font-weight:600; font-size:46px; letter-spacing:2px; color:#FFFFFF; }
+
+  /* eyebrow on band */
+  .eyebrow{ margin-top:22px; font-weight:500; font-size:19px; letter-spacing:5px; text-transform:uppercase; color:rgba(255,255,255,0.82); }
+  .eyebrow:empty{ display:none; }
+
+  /* service name — hero serif, sits straddling band edge on a white plate */
+  .plate{ margin-top:34px; background:var(--card); border-radius:14px;
+    box-shadow:0 24px 60px rgba(90,62,136,0.22); padding:44px 64px 40px; width:76%;
+    display:flex; flex-direction:column; align-items:center; }
+  .service{ font-family:'Cormorant Garamond',serif; font-weight:600; font-size:70px; line-height:1.05;
+    color:var(--lav-rich); max-width:14ch; }
+  .desc{ font-family:'Jost',sans-serif; font-weight:300; font-size:26px; line-height:1.55; color:var(--ink);
+    margin-top:20px; max-width:26ch; }
+  .desc:empty{ display:none; }
+
+  /* divider */
+  .incl-label{ margin-top:30px; font-weight:600; font-size:16px; letter-spacing:4px; text-transform:uppercase;
+    color:var(--lav-deep); display:flex; align-items:center; gap:14px; }
+  .incl-label::before, .incl-label::after{ content:""; width:30px; height:1px; background:var(--lav); }
+  .incl-label:empty{ display:none; }
+
+  /* what's included list */
+  .includes{ margin-top:22px; display:flex; flex-direction:column; gap:14px; align-items:flex-start; }
+  .includes .item{ display:flex; align-items:flex-start; gap:14px;
+    font-family:'Jost',sans-serif; font-weight:400; font-size:25px; color:var(--ink); text-align:left; }
+  .includes .item .tick{ flex:none; width:24px; height:24px; margin-top:2px; border-radius:50%;
+    background:var(--lav-deep); display:flex; align-items:center; justify-content:center; }
+  .includes .item .tick svg{ width:13px; height:13px; }
+
+  /* footer contact under the plate */
+  .footer{ margin-top:auto; margin-bottom:56px; display:flex; flex-direction:column; align-items:center; gap:6px; }
+  .contact{ font-weight:400; font-size:23px; letter-spacing:1px; color:var(--ink); }
+  .contact:empty{ display:none; }
+  .tagline{ font-family:'Cormorant Garamond',serif; font-style:italic; font-size:24px; color:var(--muted); }
+  .tagline:empty{ display:none; }
+</style>
+</head>
+<body>
+  <div class="canvas">
+    <div class="band"></div>
+    <div class="flourish"></div>
+    <div class="inner">
+      <div class="logo-wrap" id="logoWrap">
+        <img id="logo" alt="" style="display:none">
+        <span class="wordmark" id="wordmark"></span>
+      </div>
+      <div class="eyebrow" id="eyebrow"></div>
+      <div class="plate">
+        <h1 class="service" id="service"></h1>
+        <p class="desc" id="desc"></p>
+        <div class="incl-label" id="inclLabel">Included</div>
+        <div class="includes" id="includes"></div>
+      </div>
+      <div class="footer">
+        <div class="contact" id="contact"></div>
+        <div class="tagline" id="tagline"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const q = new URLSearchParams(location.search);
+  const g = (k, d='') => q.get(k) ?? d;
+  const root = document.documentElement.style;
+  if (q.get('lav'))       root.setProperty('--lav', '#'+g('lav').replace(/^#/,''));
+  if (q.get('accentTo'))  root.setProperty('--lav-deep', '#'+g('accentTo').replace(/^#/,''));
+
+  const imgWaits = [];
+  const imgStatus = { logo: 'none' };
+  const logoUrl = g('logo');
+  if (logoUrl) {
+    const el = document.getElementById('logo');
+    el.style.display = 'block'; imgStatus.logo = 'loading';
+    imgWaits.push(new Promise((resolve) => {
+      el.onload  = () => { imgStatus.logo = (el.naturalWidth>0)?'ok':'fail'; resolve(); };
+      el.onerror = () => { imgStatus.logo = 'fail'; resolve(); };
+      el.src = logoUrl;
+    }));
+  } else { document.getElementById('wordmark').textContent = g('brand',''); }
+  if (g('pill')==='1') document.getElementById('logoWrap').classList.add('pill');
+
+  document.getElementById('eyebrow').textContent = g('eyebrow');
+  document.getElementById('service').textContent = g('service', g('headline',''));
+  document.getElementById('desc').textContent = g('desc', g('body',''));
+  document.getElementById('inclLabel').textContent = g('inclLabel','Included');
+  document.getElementById('contact').textContent = g('contact', g('url',''));
+  document.getElementById('tagline').textContent = g('tagline','');
+
+  // includes: pipe-separated list, e.g. includes=Venue selection|Vendor coordination|Day-of management
+  const tick = '<span class="tick"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>';
+  const raw = g('includes','');
+  const items = raw ? raw.split('|').map(s=>s.trim()).filter(Boolean) : [];
+  document.getElementById('includes').innerHTML =
+    items.map(t => `<div class="item">${tick}<span>${t}</span></div>`).join('');
+  if (!items.length) { document.getElementById('inclLabel').style.display='none'; }
+
+  const fontsReady = (document.fonts && document.fonts.ready) ? document.fonts.ready : Promise.resolve();
+  Promise.all([fontsReady, ...imgWaits]).then(() => {
+    document.body.dataset.imgStatus = JSON.stringify(imgStatus);
+    document.body.dataset.ready = '1';
+  });
+</script>
+</body>
+</html>
