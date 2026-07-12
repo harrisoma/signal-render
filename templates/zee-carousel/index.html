@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zee Carousel</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&family=Jost:wght@300;400;500;600;700;800&display=swap');
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:1080px; height:1080px; overflow:hidden; }
+  body { font-family:'Jost',system-ui,sans-serif; }
+
+  :root{
+    --bg:#211D26;            /* deep charcoal with a violet undertone */
+    --bg2:#2E2833;
+    --pink:#EBD4F2;          /* soft pink accent (like the reference) */
+    --lav:#B79CE0;           /* Zee lavender thread */
+    --white:#FDFBFF;
+    --muted:#A79FB0;
+    --line:rgba(255,255,255,0.16);
+  }
+
+  .canvas{ position:relative; width:1080px; height:1080px; overflow:hidden;
+    background:radial-gradient(120% 90% at 70% 20%, var(--bg2) 0%, var(--bg) 60%); }
+
+  /* full-bleed hero photo behind everything, with dark scrim for text legibility */
+  .hero{ position:absolute; inset:0; background-size:cover; background-position:center; }
+  .hero-scrim{ position:absolute; inset:0;
+    background:linear-gradient(180deg, rgba(20,17,24,0.55) 0%, rgba(20,17,24,0.78) 55%, rgba(20,17,24,0.92) 100%); }
+  .hero-scrim.side{ background:linear-gradient(90deg, rgba(20,17,24,0.94) 0%, rgba(20,17,24,0.80) 45%, rgba(20,17,24,0.35) 100%); }
+
+  /* soft circular flourishes (like the reference's rings) */
+  .ring{ position:absolute; border-radius:50%; border:1px solid var(--line); }
+  .ring.r1{ width:520px;height:520px; bottom:-160px; left:-120px; }
+  .ring.r2{ width:360px;height:360px; bottom:-80px; left:-40px; border-color:rgba(235,212,242,0.14); }
+  .ring.r3{ width:300px;height:300px; top:-120px; right:-100px; }
+  .glow{ position:absolute; width:420px;height:420px; border-radius:50%;
+    background:radial-gradient(circle, rgba(183,156,224,0.22) 0%, transparent 70%); filter:blur(40px);
+    top:-140px; right:-120px; }
+
+  .inner{ position:absolute; inset:0; padding:84px 88px; display:flex; flex-direction:column; }
+
+  /* top bar: brand left, slide meta right */
+  .topbar{ display:flex; align-items:center; justify-content:space-between; }
+  .brand-lockup{ display:flex; align-items:center; gap:14px; }
+  .brand-lockup img{ height:46px; width:auto; display:block; }
+  .brand-lockup .bn{ font-family:'Cormorant Garamond',serif; font-weight:600; font-size:34px; letter-spacing:1px; color:var(--white); }
+  .datepill{ padding:11px 22px; border-radius:999px; background:linear-gradient(180deg,#EFE7F5,#D9C7E6);
+    color:#2A2530; font-weight:600; font-size:19px; }
+  .datepill:empty{ display:none; }
+
+  /* slide number badge */
+  .slideno{ font-weight:500; font-size:20px; letter-spacing:2px; color:var(--muted); }
+
+  /* ===== COVER (slide 1) ===== */
+  .cover{ flex:1; display:flex; flex-direction:column; justify-content:center; }
+  .cover .kicker{ font-weight:600; font-size:22px; letter-spacing:6px; text-transform:uppercase; color:var(--lav); margin-bottom:18px; }
+  .cover h1{ font-weight:800; font-size:150px; line-height:0.92; letter-spacing:-3px; color:var(--pink); }
+  .cover h1 .l2{ color:var(--white); display:block; }
+  .cover .pills{ display:flex; gap:20px; margin-top:44px; align-items:center; }
+  .cover .pill-ghost{ border:1.5px solid var(--white); border-radius:999px; padding:18px 40px;
+    font-weight:400; font-size:30px; color:var(--white); }
+  .cover .pill-fill{ background:linear-gradient(180deg,#F3E3F8,#E4CFEE); border-radius:999px; padding:18px 38px;
+    font-weight:500; font-size:26px; color:#2A2530; }
+  .cover .pill-fill b{ font-weight:800; margin-left:8px; }
+
+  /* ===== TOPIC SLIDES (2-7) ===== */
+  .topic{ flex:1; display:flex; flex-direction:column; justify-content:center; }
+  .topic .num{ font-family:'Cormorant Garamond',serif; font-weight:500; font-size:120px; line-height:1;
+    color:rgba(183,156,224,0.35); }
+  .topic h2{ font-weight:800; font-size:88px; line-height:0.98; letter-spacing:-1.5px; color:var(--white); margin-top:6px; max-width:15ch; }
+  .topic h2 .accent{ color:var(--pink); }
+  .topic .lead{ font-weight:300; font-size:34px; line-height:1.5; color:#E9E3F0; margin-top:34px; max-width:26ch; }
+  .topic .points{ margin-top:34px; display:flex; flex-direction:column; gap:16px; }
+  .topic .points .pt{ display:flex; align-items:flex-start; gap:16px; font-weight:400; font-size:27px; color:#D9D2E4; }
+  .topic .points .pt .d{ flex:none; width:10px; height:10px; border-radius:50%; background:var(--lav); margin-top:12px; }
+
+  /* footer: page + swipe cue */
+  .footer{ display:flex; align-items:center; justify-content:space-between; margin-top:auto; }
+  .footer .pg{ font-weight:500; font-size:20px; color:var(--muted); letter-spacing:1px; }
+  .swipe{ display:flex; align-items:center; gap:12px; font-weight:500; font-size:22px; color:var(--white); }
+  .swipe .circle{ width:56px;height:56px;border-radius:50%; background:var(--white);
+    display:flex; align-items:center; justify-content:center; }
+  .swipe .circle svg{ width:24px;height:24px; }
+  .swipe.hide{ visibility:hidden; }
+</style>
+</head>
+<body>
+  <div class="canvas">
+    <div class="hero" id="hero"></div>
+    <div class="hero-scrim" id="heroScrim" style="display:none"></div>
+    <div class="glow"></div>
+    <div class="ring r1"></div><div class="ring r2"></div><div class="ring r3"></div>
+    <div class="inner">
+      <div class="topbar">
+        <div class="brand-lockup" id="brandLockup">
+          <img id="logo" alt="" style="display:none">
+          <span class="bn" id="brandName"></span>
+        </div>
+        <div class="datepill" id="datepill"></div>
+      </div>
+
+      <!-- COVER -->
+      <div class="cover" id="coverBlock" style="display:none">
+        <div class="kicker" id="coverKicker"></div>
+        <h1 id="coverTitle"></h1>
+        <div class="pills">
+          <div class="pill-ghost" id="pillGhost"></div>
+          <div class="pill-fill" id="pillFill" style="display:none"></div>
+        </div>
+      </div>
+
+      <!-- TOPIC -->
+      <div class="topic" id="topicBlock" style="display:none">
+        <div class="num" id="topicNum"></div>
+        <h2 id="topicTitle"></h2>
+        <div class="lead" id="topicLead"></div>
+        <div class="points" id="topicPoints"></div>
+      </div>
+
+      <div class="footer">
+        <div class="pg" id="pageLabel"></div>
+        <div class="swipe" id="swipe">
+          <span id="swipeText">Swipe</span>
+          <span class="circle"><svg viewBox="0 0 24 24" fill="none" stroke="#211D26" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const q = new URLSearchParams(location.search);
+  const g = (k,d='') => q.get(k) ?? d;
+  const root = document.documentElement.style;
+  if (q.get('accent')) root.setProperty('--pink', '#'+g('accent').replace(/^#/,''));
+  if (q.get('lav'))    root.setProperty('--lav', '#'+g('lav').replace(/^#/,''));
+
+  const slide = parseInt(g('slide','1'),10) || 1;
+  const total = parseInt(g('total','7'),10) || 7;
+
+  // logo / brand
+  const imgWaits=[]; const imgStatus={logo:'none'};
+  const logoUrl=g('logo');
+  if (logoUrl){ const el=document.getElementById('logo'); el.style.display='block'; imgStatus.logo='loading';
+    imgWaits.push(new Promise(r=>{ el.onload=()=>{imgStatus.logo=el.naturalWidth>0?'ok':'fail';r()}; el.onerror=()=>{imgStatus.logo='fail';r()}; el.src=logoUrl; })); }
+  else { document.getElementById('brandName').textContent=g('brand',''); }
+
+  // hero background image (full-bleed). scrimStyle: 'bottom' (default) or 'side'
+  const imgUrl = g('image','');
+  if (imgUrl) {
+    imgStatus.hero = 'loading';
+    document.getElementById('heroScrim').style.display='block';
+    if (g('scrimStyle')==='side') document.getElementById('heroScrim').classList.add('side');
+    imgWaits.push(new Promise(r=>{
+      const probe = new Image();
+      probe.onload = () => { imgStatus.hero='ok'; document.getElementById('hero').style.backgroundImage=`url("${imgUrl}")`; r(); };
+      probe.onerror = () => { imgStatus.hero='fail'; r(); };
+      probe.src = imgUrl;
+    }));
+  }
+
+  document.getElementById('datepill').textContent = g('date','');
+  document.getElementById('pageLabel').textContent = g('pageLabel', String(slide).padStart(2,'0')+' / '+String(total).padStart(2,'0'));
+
+  // swipe cue hidden on last slide
+  if (slide >= total) document.getElementById('swipe').classList.add('hide');
+  if (q.get('swipeText')) document.getElementById('swipeText').textContent = g('swipeText');
+
+  if (slide === 1) {
+    // COVER
+    document.getElementById('coverBlock').style.display='flex';
+    document.getElementById('coverKicker').textContent = g('kicker','');
+    // title supports {{...}} for second (white) line
+    const t = g('title','');
+    document.getElementById('coverTitle').innerHTML = t.replace(/\{\{(.+?)\}\}/g,'<span class="l2">$1</span>');
+    document.getElementById('pillGhost').textContent = g('pillGhost','');
+    const pf = g('pillFill','');
+    if (pf){ const el=document.getElementById('pillFill'); el.style.display='block';
+      el.innerHTML = pf.replace(/\*(.+?)\*/g,'<b>$1</b>'); }
+    if (!g('pillGhost')) document.getElementById('pillGhost').style.display='none';
+  } else {
+    // TOPIC
+    document.getElementById('topicBlock').style.display='flex';
+    document.getElementById('topicNum').textContent = g('num', String(slide-1).padStart(2,'0'));
+    const tt = g('title','');
+    document.getElementById('topicTitle').innerHTML = tt.replace(/\{\{(.+?)\}\}/g,'<span class="accent">$1</span>');
+    document.getElementById('topicLead').textContent = g('lead','');
+    const pts = g('points','');
+    const items = pts ? pts.split('|').map(s=>s.trim()).filter(Boolean) : [];
+    document.getElementById('topicPoints').innerHTML =
+      items.map(t=>`<div class="pt"><span class="d"></span><span>${t}</span></div>`).join('');
+  }
+
+  const fontsReady=(document.fonts&&document.fonts.ready)?document.fonts.ready:Promise.resolve();
+  Promise.all([fontsReady,...imgWaits]).then(()=>{ document.body.dataset.imgStatus=JSON.stringify(imgStatus); document.body.dataset.ready='1'; });
+</script>
+</body>
+</html>
