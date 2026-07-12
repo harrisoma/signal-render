@@ -1,0 +1,14 @@
+{
+  "name": "signal-render",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Signal template render service — HTML templates to branded PNGs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.22.2",
+    "playwright": "^1.61.1"
+  }
+}

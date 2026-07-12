@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Signal Ticker Template</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:1080px; height:1080px; overflow:hidden; }
+  body { font-family:'Inter',system-ui,sans-serif; }
+
+  :root{
+    --bg:#050505;
+    --accent-from:#9945FF;
+    --accent-to:#14F195;
+    --accent-solid:#14F195;
+    --text:#FFFFFF;
+    --muted:#A6A6B2;
+    --card-from:rgba(28,24,48,0.55);
+    --card-to:rgba(10,10,16,0.66);
+    --glow:#8B5CF6;
+  }
+
+  .canvas{ position:relative; width:1080px; height:1080px; background:var(--bg); overflow:hidden; }
+  .canvas::before{ content:""; position:absolute; inset:0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.045) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.045) 1px, transparent 1px);
+    background-size:135px 135px; }
+  .glow{ position:absolute; border-radius:50%; filter:blur(80px); pointer-events:none; }
+  .glow.tr{ width:420px;height:420px; top:-150px; right:-140px;
+    background:radial-gradient(circle,var(--glow) 0%, transparent 70%); opacity:.85; }
+  .glow.bl{ width:380px;height:380px; bottom:-150px; left:-150px;
+    background:radial-gradient(circle,var(--glow) 0%, transparent 70%); opacity:.7; }
+
+  .card{ position:absolute; inset:96px; border-radius:52px;
+    background:linear-gradient(155deg,var(--card-from) 0%, var(--card-to) 100%);
+    border:1px solid rgba(255,255,255,0.07);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.06), 0 40px 90px rgba(0,0,0,0.5);
+    padding:64px 60px; display:flex; flex-direction:column; }
+
+  .header{ display:flex; align-items:center; justify-content:space-between; margin-bottom:20px; }
+  .logo-wrap{ display:inline-flex; align-items:center; border-radius:18px; }
+  .logo-wrap.pill{ background:#FFFFFF; padding:12px 16px; }
+  .logo-wrap img{ height:50px; width:auto; display:block; }
+  .logo-wrap.pill img{ height:44px; }
+  .wordmark{ font-weight:800; font-size:38px; letter-spacing:6px; color:var(--text); }
+  .dots{ display:flex; gap:8px; }
+  .dots span{ width:10px;height:10px;border-radius:50%; }
+  .dots span:nth-child(1){ background:var(--accent-solid); }
+  .dots span:nth-child(2){ background:var(--accent-from); }
+  .dots span:nth-child(3){ background:var(--glow); }
+
+  .content{ flex:1; display:flex; flex-direction:column; justify-content:center; }
+  .headline{ font-weight:700; font-size:66px; line-height:1.1; letter-spacing:-0.5px; }
+  .headline .l1{ color:var(--text); display:block; }
+  .headline .l2{ color:var(--accent-solid); display:block; margin-top:2px; }
+  .bodyrow{ margin-top:52px; display:flex; gap:26px; max-width:88%; }
+  .bodyrow .rule{ width:3px; flex:none; border-radius:2px;
+    background:linear-gradient(180deg,var(--accent-from),var(--accent-to)); }
+  .bodyrow p{ color:#E7E7EF; font-weight:400; font-size:32px; line-height:1.5; }
+
+  .footer{ margin-top:auto; display:flex; align-items:center; justify-content:space-between; }
+  .pill-url{ display:flex; align-items:center; gap:12px; padding:16px 28px;
+    border:1px solid rgba(255,255,255,0.22); border-radius:999px;
+    color:var(--text); font-weight:700; font-size:20px; }
+  .pill-url:empty{ display:none; }
+  .pill-url .globe{ width:18px;height:18px;border-radius:50%;border:1.7px solid var(--text); position:relative; flex:none; }
+  .pill-url .globe::before{ content:""; position:absolute; inset:-1.7px 4px; border:1.7px solid var(--text); border-radius:50%; }
+  .cta{ width:60px;height:60px;border-radius:50%; border:1.7px solid var(--accent-solid);
+    display:flex; align-items:center; justify-content:center; flex:none; }
+  .cta svg{ width:24px;height:24px; }
+</style>
+</head>
+<body>
+  <div class="canvas">
+    <div class="glow tr"></div>
+    <div class="glow bl"></div>
+    <div class="card">
+      <div class="header">
+        <div class="logo-wrap" id="logoWrap">
+          <img id="logo" alt="" style="display:none">
+          <span class="wordmark" id="wordmark"></span>
+        </div>
+        <div class="dots"><span></span><span></span><span></span></div>
+      </div>
+      <div class="content">
+        <div class="headline">
+          <span class="l1" id="line1"></span>
+          <span class="l2" id="line2"></span>
+        </div>
+        <div class="bodyrow"><div class="rule"></div><p id="body"></p></div>
+      </div>
+      <div class="footer">
+        <div class="pill-url" id="url"></div>
+        <div class="cta">
+          <svg viewBox="0 0 24 24" fill="none" stroke="var(--accent-solid)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="7" y1="17" x2="17" y2="7"/><polyline points="8 7 17 7 17 16"/>
+          </svg>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const q = new URLSearchParams(location.search);
+  const g = (k, d='') => q.get(k) ?? d;
+  const root = document.documentElement.style;
+
+  if (q.get('bg'))         root.setProperty('--bg', '#'+g('bg').replace(/^#/,''));
+  if (q.get('accentFrom')) root.setProperty('--accent-from', '#'+g('accentFrom').replace(/^#/,''));
+  if (q.get('accentTo'))   root.setProperty('--accent-to', '#'+g('accentTo').replace(/^#/,''));
+  const solid = g('accent', g('accentTo', g('accentFrom','')));
+  if (solid) root.setProperty('--accent-solid', '#'+solid.replace(/^#/,''));
+  if (q.get('glow'))       root.setProperty('--glow', '#'+g('glow').replace(/^#/,''));
+
+  // async image loading: only signal ready after the logo genuinely loads or fails
+  const imgWaits = [];
+  const imgStatus = { logo: 'none' }; // none|ok|fail
+
+  const logoUrl = g('logo');
+  if (logoUrl) {
+    const el = document.getElementById('logo');
+    el.style.display = 'block';
+    imgStatus.logo = 'loading';
+    imgWaits.push(new Promise((resolve) => {
+      el.onload  = () => { imgStatus.logo = (el.naturalWidth > 0) ? 'ok' : 'fail'; resolve(); };
+      el.onerror = () => { imgStatus.logo = 'fail'; resolve(); };
+      el.src = logoUrl;
+    }));
+  } else {
+    document.getElementById('wordmark').textContent = g('brand','');
+  }
+  if (g('pill')==='1' || g('pill')==='white') document.getElementById('logoWrap').classList.add('pill');
+
+  // headline: line1 = plain (white), line2 = accent (colored). eyebrow-style two-liner.
+  document.getElementById('line1').textContent = g('line1', g('headline',''));
+  document.getElementById('line2').textContent = g('line2','');
+  document.getElementById('body').textContent = g('body');
+
+  const url = g('url');
+  if (url) document.getElementById('url').innerHTML = '<span class="globe"></span>'+url;
+
+  const fontsReady = (document.fonts && document.fonts.ready) ? document.fonts.ready : Promise.resolve();
+  Promise.all([fontsReady, ...imgWaits]).then(() => {
+    document.body.dataset.imgStatus = JSON.stringify(imgStatus);
+    document.body.dataset.ready = '1';
+  });
+</script>
+</body>
+</html>
