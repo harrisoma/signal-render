@@ -1,10 +1,10 @@
 import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const sourcePath = new URL("./server.js", import.meta.url);
-const patchedPath = path.join(os.tmpdir(), "signal-render-server-patched.mjs");
+const repoDir = path.dirname(fileURLToPath(import.meta.url));
+const sourcePath = path.join(repoDir, "server.js");
+const patchedPath = path.join(repoDir, ".server-patched.mjs");
 
 const oldBlock = `    const concatPath = path.join(workDir, "scenes.txt");
     const concatLines = [];
@@ -54,9 +54,8 @@ const newBlock = `    const { width, height } = dimensionsForFormat(payload.form
       current_step: "encoding_video",
     });
 
-    // Normalize every image input before concatenation. The former concat-demuxer
-    // path inherited stream parameters from the first image and could collapse
-    // mixed-size scene images into a frozen first frame.
+    // Normalize every image before concat. The old concat-demuxer inherited
+    // stream parameters from image one and could freeze mixed-size scenes.
     const inputs = [];
     for (const scene of localScenes) {
       inputs.push("-loop", "1", "-t", scene.duration.toFixed(3), "-i", scene.path);
@@ -87,6 +86,5 @@ if (!source.includes(oldBlock)) {
   throw new Error("Expected video concat block was not found; refusing to start an unpatched renderer.");
 }
 
-const patched = source.replace(oldBlock, newBlock);
-await fs.writeFile(patchedPath, patched, "utf8");
-await import(pathToFileURL(patchedPath).href);
+await fs.writeFile(patchedPath, source.replace(oldBlock, newBlock), "utf8");
+await import(`${pathToFileURL(patchedPath).href}?v=${Date.now()}`);
