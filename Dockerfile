@@ -3,7 +3,10 @@
 # This avoids the #1 headache of running headless Chromium on Railway.
 FROM mcr.microsoft.com/playwright:v1.61.1-jammy
 WORKDIR /app
-
+# ffmpeg + ffprobe for video rendering
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 # install deps first (better layer caching)
 COPY package.json ./
 RUN npm install --omit=dev
