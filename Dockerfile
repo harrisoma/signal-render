@@ -1,3 +1,4 @@
+# trigger rebuild
 # Playwright's official image ships Chromium + all system deps + common fonts.
 # This avoids the #1 headache of running headless Chromium on Railway.
 FROM mcr.microsoft.com/playwright:v1.61.1-jammy
