@@ -7,7 +7,6 @@ WORKDIR /app
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
   && rm -rf /var/lib/apt/lists/*
-# install deps first (better layer caching)
 COPY package.json ./
 RUN npm install --omit=dev
 
