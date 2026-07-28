@@ -189,18 +189,22 @@ async function processVideoJob(p) {
     lines.push(`file '${scenePaths[scenePaths.length - 1].file}'`);
     await writeFile(listFile, lines.join("\n") + "\n");
 
-    // 3. Render
-    const size =
-      p.format === "9x16" ? "1080x1920" :
-      p.format === "16x9" ? "1920x1080" :
-      "1080x1080";
+    // 3. Render — map project format ("9:16" | "1:1" | "16:9", tolerating "9x16"/"16x9")
+    // to output dimensions. Use force_original_aspect_ratio=increase + crop to
+    // achieve "cover" behavior (ffmpeg has no "cover" value for that option).
+    const fmt = String(p.format || "").replace("x", ":");
+    const [width, height] =
+      fmt === "9:16" ? [1080, 1920] :
+      fmt === "16:9" ? [1920, 1080] :
+      [1080, 1080];
+    const coverVf = `scale=${width}:${height}:force_original_aspect_ratio=increase:flags=bicubic,crop=${width}:${height},setsar=1`;
 
     const outPath = join(dir, "out.mp4");
     await runFfmpeg([
       "-y",
       "-f", "concat", "-safe", "0",
       "-i", listFile,
-      "-vf", `scale=${size}:force_original_aspect_ratio=cover,setsar=1,fps=30`,
+      "-vf", `${coverVf},fps=30`,
       "-c:v", "libx264",
       "-pix_fmt", "yuv420p",
       "-preset", "veryfast",
@@ -213,7 +217,7 @@ async function processVideoJob(p) {
     await runFfmpeg([
       "-y",
       "-i", scenePaths[0].file,
-      "-vf", `scale=${size}:force_original_aspect_ratio=cover,setsar=1`,
+      "-vf", coverVf,
       "-q:v", "3",
       thumbPath,
     ]);
@@ -292,5 +296,5 @@ async function putSigned(url, bytes, contentType) {
 }
 
 app.listen(PORT, () => {
-  console.log(`signal-render worker listening on :${PORT} (status endpoint: ${STATUS_ENDPOINT || "unset"})`);
+  console.log(`signal-render worker listening on: ${PORT} (status endpoint: ${STATUS_ENDPOINT || "unset"})`);
 });
