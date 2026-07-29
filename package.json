@@ -1,16 +1,18 @@
 {
-  "name": "signal-render",
-  "version": "1.1.1",
+  "name": "signal-render-worker",
+  "version": "2.1.0",
+  "private": true,
   "type": "module",
-  "description": "Signal render service — branded static assets and Onixus video jobs",
   "main": "server.js",
   "scripts": {
-    "start": "node patch-server.mjs"
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.57.4",
-    "express": "^4.22.2",
+    "express": "^4.19.2",
     "ffmpeg-static": "^5.2.0",
-    "playwright": "^1.61.1"
+    "ffprobe-static": "^3.1.0"
   }
 }

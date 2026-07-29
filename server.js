@@ -15,6 +15,20 @@ import { mkdtemp, writeFile, readFile, stat, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+// ffmpeg/ffprobe resolution: prefer the bundled static binaries so the worker
+// renders under any Railway builder (Nixpacks/Railpack images ship no ffmpeg);
+// fall back to PATH for the Dockerfile build.
+let FFMPEG = "ffmpeg";
+let FFPROBE = "ffprobe";
+try {
+  const { default: p } = await import("ffmpeg-static");
+  if (p) FFMPEG = p;
+} catch {}
+try {
+  const { default: p } = await import("ffprobe-static");
+  if (p?.path) FFPROBE = p.path;
+} catch {}
+
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 
@@ -30,7 +44,7 @@ const jobs = new Map();
 
 function hasFfmpeg() {
   return new Promise((resolve) => {
-    const p = spawn("ffmpeg", ["-version"]);
+    const p = spawn(FFMPEG, ["-version"]);
     p.on("error", () => resolve(false));
     p.on("exit", (code) => resolve(code === 0));
   });
@@ -38,7 +52,7 @@ function hasFfmpeg() {
 
 function ffmpegVersion() {
   return new Promise((resolve) => {
-    const p = spawn("ffmpeg", ["-version"]);
+    const p = spawn(FFMPEG, ["-version"]);
     let out = "";
     p.stdout.on("data", (d) => (out += d.toString()));
     p.on("error", () => resolve("unknown"));
@@ -46,9 +60,92 @@ function ffmpegVersion() {
   });
 }
 
+// ---- Captions (ASS subtitle) helpers ----
+function msToAss(ms) {
+  const cs = Math.max(0, Math.round(Number(ms) / 10)); // centiseconds
+  const h = Math.floor(cs / 360000);
+  const m = Math.floor((cs % 360000) / 6000);
+  const s = Math.floor((cs % 6000) / 100);
+  const c = cs % 100;
+  return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(c).padStart(2, "0")}`;
+}
+function assEscape(t) {
+  return String(t).replace(/\r?\n/g, " ").replace(/\{/g, "(").replace(/\}/g, ")").trim();
+}
+// Build a styled ASS caption track from per-scene on_screen_text + timings.
+function buildAss(scenes, width, height) {
+  const fs = Math.max(28, Math.round(height * 0.05));
+  const marginV = Math.round(height * 0.1);
+  const header =
+    `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${width}
+PlayResY: ${height}
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Cap,Arial,${fs},&H00FFFFFF,&H00000000,&H96000000,1,0,0,0,100,100,0,0,1,4,1,2,80,80,${marginV},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`;
+  const dialogue = (scenes || [])
+    .filter((s) => s && s.on_screen_text && String(s.on_screen_text).trim())
+    .map((s) => `Dialogue: 0,${msToAss(s.start_ms)},${msToAss(s.end_ms)},Cap,,0,0,0,,${assEscape(s.on_screen_text)}`);
+  return `${header}\n${dialogue.join("\n")}\n`;
+}
+
+function fmtDims(fmt) {
+  const f = String(fmt || "").replace("x", ":");
+  return f === "9:16" ? [1080, 1920] : f === "16:9" ? [1920, 1080] : [1080, 1080];
+}
+
+// One Ken-Burns clip from a still: slow centered zoom, output at target size/fps.
+async function kenBurnsClip(img, outPath, durSec, w, h) {
+  const frames = Math.max(2, Math.round(durSec * 30));
+  const zi = w * 2, hi = h * 2; // 2x headroom so the zoom stays sharp
+  const vf =
+    `scale=${zi}:${hi}:force_original_aspect_ratio=increase,crop=${zi}:${hi},` +
+    `zoompan=z='min(zoom+0.0012,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}:fps=30,` +
+    `setsar=1,format=yuv420p`;
+  await runFfmpeg(["-y", "-loop", "1", "-t", durSec.toFixed(3), "-i", img, "-vf", vf, "-r", "30", "-an", outPath]);
+}
+
+// Join Ken-Burns clips with crossfades; optionally burn captions + mux voiceover.
+async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, assPath, T) {
+  const n = clips.length;
+  const args = ["-y"];
+  clips.forEach((c) => args.push("-i", c));
+  if (voicePath) args.push("-i", voicePath);
+
+  const fc = [];
+  let last = "0:v";
+  if (n > 1) {
+    let acc = durs[0], prev = "0:v";
+    for (let k = 1; k < n; k++) {
+      const off = Math.max(0, acc - T);
+      const out = `vx${k}`;
+      fc.push(`[${prev}][${k}:v]xfade=transition=fade:duration=${T.toFixed(3)}:offset=${off.toFixed(3)}[${out}]`);
+      acc = acc + durs[k] - T;
+      prev = out;
+    }
+    last = prev;
+  }
+  let voutIsLabel = last !== "0:v";
+  let vout = last;
+  if (assPath) { fc.push(`[${last}]subtitles=${assPath}[vout]`); vout = "vout"; voutIsLabel = true; }
+
+  if (fc.length) args.push("-filter_complex", fc.join(";"));
+  args.push("-map", voutIsLabel ? `[${vout}]` : vout);
+  if (voicePath) args.push("-map", `${n}:a`, "-c:a", "aac", "-b:a", "128k", "-shortest");
+  args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "22", outPath);
+  await runFfmpeg(args);
+}
+
 function runFfmpeg(args) {
   return new Promise((resolve, reject) => {
-    const p = spawn("ffmpeg", args);
+    const p = spawn(FFMPEG, args);
     let stderr = "";
     p.stderr.on("data", (d) => (stderr += d.toString()));
     p.on("error", reject);
@@ -61,7 +158,7 @@ function runFfmpeg(args) {
 
 function probeDuration(file) {
   return new Promise((resolve, reject) => {
-    const p = spawn("ffprobe", [
+    const p = spawn(FFPROBE, [
       "-v", "error",
       "-show_entries", "format=duration",
       "-of", "default=nk=1:nw=1",
@@ -178,39 +275,64 @@ async function processVideoJob(p) {
 
     await reportStatus(jobId, projectId, { progress: 35, current_step: "encoding" });
 
-    // 2. Concat script — ffmpeg concat demuxer quirk: repeat LAST file with no duration
-    const listFile = join(dir, "concat.txt");
-    const lines = [];
-    for (const s of scenePaths) {
-      const dur = Math.max(0.5, (s.end_ms - s.start_ms) / 1000);
-      lines.push(`file '${s.file}'`);
-      lines.push(`duration ${dur.toFixed(3)}`);
-    }
-    lines.push(`file '${scenePaths[scenePaths.length - 1].file}'`);
-    await writeFile(listFile, lines.join("\n") + "\n");
+    // Output dimensions from project format ("9:16" | "1:1" | "16:9",
+    // tolerating "9x16"/"16x9"). cover-fit via increase + crop.
+    const [width, height] = fmtDims(p.format);
+    const durs = scenePaths.map((s) => Math.max(0.6, (s.end_ms - s.start_ms) / 1000));
 
-    // 3. Render — map project format ("9:16" | "1:1" | "16:9", tolerating "9x16"/"16x9")
-    // to output dimensions. Use force_original_aspect_ratio=increase + crop to
-    // achieve "cover" behavior (ffmpeg has no "cover" value for that option).
-    const fmt = String(p.format || "").replace("x", ":");
-    const [width, height] =
-      fmt === "9:16" ? [1080, 1920] :
-      fmt === "16:9" ? [1920, 1080] :
-      [1080, 1080];
-    const coverVf = `scale=${width}:${height}:force_original_aspect_ratio=increase:flags=bicubic,crop=${width}:${height},setsar=1`;
+    // --- shared: optional voiceover (coordinator TTS) + caption track ---
+    let voicePath = null;
+    if (p.voiceover_url) {
+      try {
+        const vr = await fetch(p.voiceover_url);
+        if (vr.ok) { voicePath = join(dir, "voice.mp3"); await writeFile(voicePath, Buffer.from(await vr.arrayBuffer())); }
+        else console.warn(`[job ${jobId}] voiceover download ${vr.status}; silent`);
+      } catch (e) { console.warn(`[job ${jobId}] voiceover fetch failed (${String(e?.message || e)}); silent`); }
+    }
+    let assPath = null;
+    if (p.captions_enabled && sorted.some((s) => s.on_screen_text && String(s.on_screen_text).trim())) {
+      assPath = join(dir, "captions.ass");
+      await writeFile(assPath, buildAss(sorted, width, height));
+    }
 
     const outPath = join(dir, "out.mp4");
-    await runFfmpeg([
-      "-y",
-      "-f", "concat", "-safe", "0",
-      "-i", listFile,
-      "-vf", `${coverVf},fps=30`,
-      "-c:v", "libx264",
-      "-pix_fmt", "yuv420p",
-      "-preset", "veryfast",
-      "-crf", "22",
-      outPath,
-    ]);
+    const coverVf = `scale=${width}:${height}:force_original_aspect_ratio=increase:flags=bicubic,crop=${width}:${height},setsar=1`;
+
+    // Fallback: the reliable timed slideshow (no motion), captions + voice muxed.
+    async function renderSimple() {
+      const listFile = join(dir, "concat.txt");
+      const lines = [];
+      for (const s of scenePaths) { lines.push(`file '${s.file}'`); lines.push(`duration ${(Math.max(0.6, (s.end_ms - s.start_ms) / 1000)).toFixed(3)}`); }
+      lines.push(`file '${scenePaths[scenePaths.length - 1].file}'`);
+      await writeFile(listFile, lines.join("\n") + "\n");
+      let vf = `${coverVf},fps=30`;
+      if (assPath) vf += `,subtitles=${assPath}`;
+      const a = ["-y", "-f", "concat", "-safe", "0", "-i", listFile];
+      if (voicePath) a.push("-i", voicePath);
+      a.push("-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "22");
+      if (voicePath) a.push("-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "128k", "-shortest");
+      a.push(outPath);
+      await runFfmpeg(a);
+    }
+
+    // Cinematic: per-scene Ken-Burns clips joined with crossfades. Falls back to
+    // the simple path on any ffmpeg error so a render never fails outright.
+    let renderStyle = "cinematic";
+    try {
+      const clips = [];
+      for (let i = 0; i < scenePaths.length; i++) {
+        const cp = join(dir, `clip-${i}.mp4`);
+        await kenBurnsClip(scenePaths[i].file, cp, durs[i], width, height);
+        clips.push(cp);
+      }
+      const T = Math.min(0.6, Math.min(...durs) * 0.4); // transition < shortest clip
+      await xfadeAssemble(clips, durs, outPath, width, height, voicePath, assPath, T);
+    } catch (err) {
+      console.warn(`[job ${jobId}] cinematic render failed (${String(err?.message || err).slice(0, 200)}); falling back to slideshow`);
+      renderStyle = "slideshow_fallback";
+      await renderSimple();
+    }
+    console.log(`[job ${jobId}] render style: ${renderStyle}`);
 
     // 4. Thumbnail from first scene
     const thumbPath = join(dir, "thumb.jpg");
@@ -296,5 +418,5 @@ async function putSigned(url, bytes, contentType) {
 }
 
 app.listen(PORT, () => {
-  console.log(`signal-render worker listening on: ${PORT} (status endpoint: ${STATUS_ENDPOINT || "unset"})`);
+  console.log(`signal-render worker listening on :${PORT} (status endpoint: ${STATUS_ENDPOINT || "unset"})`);
 });

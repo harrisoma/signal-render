@@ -1,0 +1,10 @@
+# Nixpacks alternative (if Railway isn't using the Dockerfile).
+# Ensures ffmpeg/ffprobe are on PATH.
+[phases.setup]
+nixPkgs = ["nodejs_20", "ffmpeg"]
+
+[phases.install]
+cmds = ["npm install --omit=dev"]
+
+[start]
+cmd = "node server.js"
