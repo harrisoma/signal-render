@@ -102,14 +102,20 @@ function fmtDims(fmt) {
 }
 
 // One Ken-Burns clip from a still: slow centered zoom, output at target size/fps.
+// 1.5x supersample (max zoom is 1.18, so headroom to spare) + ultrafast preset:
+// the intermediate clips are re-encoded in the assemble pass, so cheap here is
+// free quality-wise and keeps render times sane on a single shared vCPU.
 async function kenBurnsClip(img, outPath, durSec, w, h) {
   const frames = Math.max(2, Math.round(durSec * 30));
-  const zi = w * 2, hi = h * 2; // 2x headroom so the zoom stays sharp
+  const zi = Math.round((w * 1.5) / 2) * 2, hi = Math.round((h * 1.5) / 2) * 2;
   const vf =
     `scale=${zi}:${hi}:force_original_aspect_ratio=increase,crop=${zi}:${hi},` +
     `zoompan=z='min(zoom+0.0012,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}:fps=30,` +
     `setsar=1,format=yuv420p`;
-  await runFfmpeg(["-y", "-loop", "1", "-t", durSec.toFixed(3), "-i", img, "-vf", vf, "-r", "30", "-an", outPath]);
+  await runFfmpeg([
+    "-y", "-loop", "1", "-t", durSec.toFixed(3), "-i", img, "-vf", vf,
+    "-r", "30", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", outPath,
+  ]);
 }
 
 // Join Ken-Burns clips with crossfades; optionally burn captions + mux voiceover.
@@ -240,17 +246,30 @@ app.get("/health", async (_req, res) => {
   });
 });
 
+// Renders run strictly one at a time — concurrent ffmpeg pipelines on a small
+// shared vCPU just starve each other. Duplicate submissions of an in-flight
+// job (UI retries) are acknowledged without enqueueing a second render.
+let renderChain = Promise.resolve();
+
 app.post("/render-video", auth, (req, res) => {
   const payload = req.body;
   const err = validateVideoPayload(payload);
   if (err) return res.status(400).json({ error: err });
 
+  const existing = jobs.get(payload.job_id);
+  if (existing && (existing.status === "queued" || existing.status === "rendering")) {
+    return res.status(202).json({ ok: true, accepted: true, job_id: payload.job_id, deduped: true });
+  }
+
   jobs.set(payload.job_id, { status: "queued" });
   res.status(202).json({ ok: true, accepted: true, job_id: payload.job_id });
 
-  processVideoJob(payload).catch((err) => {
-    console.error(`[job ${payload.job_id}] fatal`, err);
-  });
+  renderChain = renderChain
+    .catch(() => {})
+    .then(() => processVideoJob(payload))
+    .catch((err) => {
+      console.error(`[job ${payload.job_id}] fatal`, err);
+    });
 });
 
 async function processVideoJob(p) {
