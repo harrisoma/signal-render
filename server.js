@@ -108,13 +108,16 @@ function fmtDims(fmt) {
 async function kenBurnsClip(img, outPath, durSec, w, h) {
   const frames = Math.max(2, Math.round(durSec * 30));
   const zi = Math.round((w * 1.5) / 2) * 2, hi = Math.round((h * 1.5) / 2) * 2;
+  // The still goes in as a SINGLE frame; zoompan's d= then emits exactly
+  // `frames` output frames from it. (Looping the input first multiplies the
+  // output by d per duplicated input frame — hours of video per clip.)
   const vf =
     `scale=${zi}:${hi}:force_original_aspect_ratio=increase,crop=${zi}:${hi},` +
     `zoompan=z='min(zoom+0.0012,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}:fps=30,` +
     `setsar=1,format=yuv420p`;
   await runFfmpeg([
-    "-y", "-loop", "1", "-t", durSec.toFixed(3), "-i", img, "-vf", vf,
-    "-r", "30", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", outPath,
+    "-y", "-i", img, "-vf", vf, "-frames:v", String(frames),
+    "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", outPath,
   ]);
 }
 
