@@ -121,12 +121,45 @@ async function kenBurnsClip(img, outPath, durSec, w, h) {
   ]);
 }
 
-// Join Ken-Burns clips with crossfades; optionally burn captions + mux voiceover.
-async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, assPath, T) {
+// One clip from real stock footage: cover-crop to target, 30fps, freeze-pad the
+// last frame if the source runs short, hard-cap at the scene duration.
+async function stockClip(src, outPath, durSec, w, h) {
+  const vf =
+    `scale=${w}:${h}:force_original_aspect_ratio=increase:flags=bicubic,crop=${w}:${h},` +
+    `fps=30,tpad=stop_mode=clone:stop_duration=${durSec.toFixed(3)},setsar=1,format=yuv420p`;
+  await runFfmpeg([
+    "-y", "-i", src, "-vf", vf, "-t", durSec.toFixed(3),
+    "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", outPath,
+  ]);
+}
+
+// Audio graph shared by both render paths. Voiceover is mixed at full level with
+// music ducked underneath (music alone plays near-full); music always fades out
+// over the last 1.5s. Returns the label to map, or null for voice-only/none.
+function buildAudioGraph(fc, { voiceIdx, musicIdx, total }) {
+  const fadeSt = Math.max(0, total - 1.5).toFixed(3);
+  if (voiceIdx != null && musicIdx != null) {
+    fc.push(`[${voiceIdx}:a]apad[va]`);
+    fc.push(`[${musicIdx}:a]volume=0.22,afade=t=out:st=${fadeSt}:d=1.5[ma]`);
+    fc.push(`[va][ma]amix=inputs=2:duration=longest:normalize=0[aout]`);
+    return "aout";
+  }
+  if (musicIdx != null) {
+    fc.push(`[${musicIdx}:a]volume=0.85,afade=t=out:st=${fadeSt}:d=1.5[aout]`);
+    return "aout";
+  }
+  return null;
+}
+
+// Join scene clips with crossfades; optionally burn captions + mux voiceover/music.
+async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, assPath, T) {
   const n = clips.length;
   const args = ["-y"];
   clips.forEach((c) => args.push("-i", c));
+  const voiceIdx = voicePath ? n : null;
   if (voicePath) args.push("-i", voicePath);
+  const musicIdx = musicPath ? n + (voicePath ? 1 : 0) : null;
+  if (musicPath) args.push("-i", musicPath);
 
   const fc = [];
   let last = "0:v";
@@ -145,12 +178,15 @@ async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, assPath, T) 
   let vout = last;
   if (assPath) { fc.push(`[${last}]subtitles=${assPath}[vout]`); vout = "vout"; voutIsLabel = true; }
 
+  // Explicit -t instead of -shortest: a voiceover shorter than the video must
+  // not truncate it (music/silence covers the tail); longer audio gets cut here.
+  const total = durs.reduce((a, b) => a + b, 0) - T * (n - 1);
+  const aout = buildAudioGraph(fc, { voiceIdx, musicIdx, total });
+
   if (fc.length) args.push("-filter_complex", fc.join(";"));
   args.push("-map", voutIsLabel ? `[${vout}]` : vout);
-  if (voicePath) args.push("-map", `${n}:a`, "-c:a", "aac", "-b:a", "128k");
-  // Explicit -t instead of -shortest: a voiceover shorter than the video must
-  // not truncate it (it just goes silent); a longer one gets cut here.
-  const total = durs.reduce((a, b) => a + b, 0) - T * (n - 1);
+  if (aout) args.push("-map", `[${aout}]`, "-c:a", "aac", "-b:a", "128k");
+  else if (voiceIdx != null) args.push("-map", `${voiceIdx}:a`, "-c:a", "aac", "-b:a", "128k");
   args.push("-t", total.toFixed(3));
   args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "22", outPath);
   await runFfmpeg(args);
@@ -237,7 +273,7 @@ function validateVideoPayload(p) {
   if (!Array.isArray(p.scenes) || p.scenes.length !== p.expected_scene_count) {
     return "scene count mismatch";
   }
-  if (p.scenes.some((s) => !s?.image_url)) return "one or more scenes missing image_url";
+  if (p.scenes.some((s) => !s?.image_url && !s?.video_url)) return "one or more scenes missing image_url/video_url";
   return null;
 }
 
@@ -288,7 +324,9 @@ async function processVideoJob(p) {
   try {
     await reportStatus(jobId, projectId, { status: "rendering", progress: 5, current_step: "downloading_scenes" });
 
-    // 1. Download scenes (sorted by idx)
+    // 1. Download scenes (sorted by idx). Every scene has a still (used for the
+    // thumbnail and as Ken-Burns source/fallback); stock scenes also carry a
+    // video_url whose download failure quietly demotes them back to stills.
     const sorted = [...p.scenes].sort((a, b) => a.idx - b.idx);
     const scenePaths = [];
     for (const s of sorted) {
@@ -296,7 +334,15 @@ async function processVideoJob(p) {
       if (!r.ok) throw new Error(`scene ${s.idx} download ${r.status}`);
       const file = join(dir, `scene-${s.idx}.jpg`);
       await writeFile(file, Buffer.from(await r.arrayBuffer()));
-      scenePaths.push({ ...s, file });
+      let videoFile = null;
+      if (s.video_url) {
+        try {
+          const vr = await fetch(s.video_url);
+          if (vr.ok) { videoFile = join(dir, `scene-${s.idx}.mp4`); await writeFile(videoFile, Buffer.from(await vr.arrayBuffer())); }
+          else console.warn(`[job ${jobId}] scene ${s.idx} stock video ${vr.status}; using still`);
+        } catch (e) { console.warn(`[job ${jobId}] scene ${s.idx} stock fetch failed (${String(e?.message || e)}); using still`); }
+      }
+      scenePaths.push({ ...s, file, videoFile });
     }
 
     await reportStatus(jobId, projectId, { progress: 35, current_step: "encoding" });
@@ -320,11 +366,19 @@ async function processVideoJob(p) {
       assPath = join(dir, "captions.ass");
       await writeFile(assPath, buildAss(sorted, width, height));
     }
+    let musicPath = null;
+    if (p.music_enabled !== false && p.music_url) {
+      try {
+        const mr = await fetch(p.music_url);
+        if (mr.ok) { musicPath = join(dir, "music.mp3"); await writeFile(musicPath, Buffer.from(await mr.arrayBuffer())); }
+        else console.warn(`[job ${jobId}] music download ${mr.status}; silent bed`);
+      } catch (e) { console.warn(`[job ${jobId}] music fetch failed (${String(e?.message || e)}); silent bed`); }
+    }
 
     const outPath = join(dir, "out.mp4");
     const coverVf = `scale=${width}:${height}:force_original_aspect_ratio=increase:flags=bicubic,crop=${width}:${height},setsar=1`;
 
-    // Fallback: the reliable timed slideshow (no motion), captions + voice muxed.
+    // Fallback: the reliable timed slideshow (no motion), captions + audio muxed.
     async function renderSimple() {
       const listFile = join(dir, "concat.txt");
       const lines = [];
@@ -334,10 +388,18 @@ async function processVideoJob(p) {
       let vf = `${coverVf},fps=30`;
       if (assPath) vf += `,subtitles=${assPath}`;
       const a = ["-y", "-f", "concat", "-safe", "0", "-i", listFile];
+      const voiceIdx = voicePath ? 1 : null;
       if (voicePath) a.push("-i", voicePath);
-      a.push("-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "22");
-      if (voicePath) a.push("-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "128k");
-      a.push("-t", durs.reduce((x, y) => x + y, 0).toFixed(3));
+      const musicIdx = musicPath ? 1 + (voicePath ? 1 : 0) : null;
+      if (musicPath) a.push("-i", musicPath);
+      const total = durs.reduce((x, y) => x + y, 0);
+      const fc = [`[0:v]${vf}[vout]`];
+      const aout = buildAudioGraph(fc, { voiceIdx, musicIdx, total });
+      a.push("-filter_complex", fc.join(";"), "-map", "[vout]");
+      if (aout) a.push("-map", `[${aout}]`, "-c:a", "aac", "-b:a", "128k");
+      else if (voiceIdx != null) a.push("-map", `${voiceIdx}:a`, "-c:a", "aac", "-b:a", "128k");
+      a.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "22");
+      a.push("-t", total.toFixed(3));
       a.push(outPath);
       await runFfmpeg(a);
     }
@@ -355,10 +417,19 @@ async function processVideoJob(p) {
       const clips = [];
       for (let i = 0; i < scenePaths.length; i++) {
         const cp = join(dir, `clip-${i}.mp4`);
-        await kenBurnsClip(scenePaths[i].file, cp, clipDurs[i], width, height);
+        if (scenePaths[i].videoFile) {
+          try {
+            await stockClip(scenePaths[i].videoFile, cp, clipDurs[i], width, height);
+          } catch (e) {
+            console.warn(`[job ${jobId}] scene ${scenePaths[i].idx} stock clip failed (${String(e?.message || e).slice(0, 120)}); Ken Burns fallback`);
+            await kenBurnsClip(scenePaths[i].file, cp, clipDurs[i], width, height);
+          }
+        } else {
+          await kenBurnsClip(scenePaths[i].file, cp, clipDurs[i], width, height);
+        }
         clips.push(cp);
       }
-      await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, assPath, T);
+      await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, musicPath, assPath, T);
     } catch (err) {
       console.warn(`[job ${jobId}] cinematic render failed (${String(err?.message || err).slice(0, 200)}); falling back to slideshow`);
       renderStyle = "slideshow_fallback";
