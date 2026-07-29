@@ -147,7 +147,11 @@ async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, assPath, T) 
 
   if (fc.length) args.push("-filter_complex", fc.join(";"));
   args.push("-map", voutIsLabel ? `[${vout}]` : vout);
-  if (voicePath) args.push("-map", `${n}:a`, "-c:a", "aac", "-b:a", "128k", "-shortest");
+  if (voicePath) args.push("-map", `${n}:a`, "-c:a", "aac", "-b:a", "128k");
+  // Explicit -t instead of -shortest: a voiceover shorter than the video must
+  // not truncate it (it just goes silent); a longer one gets cut here.
+  const total = durs.reduce((a, b) => a + b, 0) - T * (n - 1);
+  args.push("-t", total.toFixed(3));
   args.push("-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "22", outPath);
   await runFfmpeg(args);
 }
@@ -332,7 +336,8 @@ async function processVideoJob(p) {
       const a = ["-y", "-f", "concat", "-safe", "0", "-i", listFile];
       if (voicePath) a.push("-i", voicePath);
       a.push("-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast", "-crf", "22");
-      if (voicePath) a.push("-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "128k", "-shortest");
+      if (voicePath) a.push("-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "128k");
+      a.push("-t", durs.reduce((x, y) => x + y, 0).toFixed(3));
       a.push(outPath);
       await runFfmpeg(a);
     }
@@ -341,14 +346,19 @@ async function processVideoJob(p) {
     // the simple path on any ffmpeg error so a render never fails outright.
     let renderStyle = "cinematic";
     try {
+      // Each crossfade overlaps adjacent clips by T, shortening the timeline by
+      // T*(n-1). Pad every clip except the last by T so the assembled video runs
+      // exactly the scene-sum duration — and each transition then starts exactly
+      // at the original scene boundary, keeping the ASS captions in sync.
+      const T = Math.min(0.6, Math.min(...durs) * 0.4); // transition < shortest clip
+      const clipDurs = durs.map((d, i) => (i < durs.length - 1 ? d + T : d));
       const clips = [];
       for (let i = 0; i < scenePaths.length; i++) {
         const cp = join(dir, `clip-${i}.mp4`);
-        await kenBurnsClip(scenePaths[i].file, cp, durs[i], width, height);
+        await kenBurnsClip(scenePaths[i].file, cp, clipDurs[i], width, height);
         clips.push(cp);
       }
-      const T = Math.min(0.6, Math.min(...durs) * 0.4); // transition < shortest clip
-      await xfadeAssemble(clips, durs, outPath, width, height, voicePath, assPath, T);
+      await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, assPath, T);
     } catch (err) {
       console.warn(`[job ${jobId}] cinematic render failed (${String(err?.message || err).slice(0, 200)}); falling back to slideshow`);
       renderStyle = "slideshow_fallback";
