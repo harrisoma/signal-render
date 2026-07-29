@@ -151,8 +151,9 @@ function buildAudioGraph(fc, { voiceIdx, musicIdx, total }) {
   return null;
 }
 
-// Join scene clips with crossfades; optionally burn captions + mux voiceover/music.
-async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, assPath, T) {
+// Join scene clips with crossfades; optionally brand-logo watermark, burned
+// captions, and voiceover/music mux.
+async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, assPath, logoPath, T) {
   const n = clips.length;
   const args = ["-y"];
   clips.forEach((c) => args.push("-i", c));
@@ -160,6 +161,8 @@ async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, a
   if (voicePath) args.push("-i", voicePath);
   const musicIdx = musicPath ? n + (voicePath ? 1 : 0) : null;
   if (musicPath) args.push("-i", musicPath);
+  const logoIdx = logoPath ? n + (voicePath ? 1 : 0) + (musicPath ? 1 : 0) : null;
+  if (logoPath) args.push("-i", logoPath);
 
   const fc = [];
   let last = "0:v";
@@ -173,6 +176,12 @@ async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, a
       prev = out;
     }
     last = prev;
+  }
+  if (logoIdx != null) {
+    const lw = Math.round(w * 0.14), m = Math.round(w * 0.04);
+    fc.push(`[${logoIdx}:v]scale=${lw}:-1[lg]`);
+    fc.push(`[${last}][lg]overlay=x=W-w-${m}:y=${m}:format=auto[vlogo]`);
+    last = "vlogo";
   }
   let voutIsLabel = last !== "0:v";
   let vout = last;
@@ -374,6 +383,18 @@ async function processVideoJob(p) {
         else console.warn(`[job ${jobId}] music download ${mr.status}; silent bed`);
       } catch (e) { console.warn(`[job ${jobId}] music fetch failed (${String(e?.message || e)}); silent bed`); }
     }
+    // Brand logo watermark (best-effort; PNG alpha honored by overlay).
+    let logoPath = null;
+    if (p.brand?.logo_url) {
+      try {
+        const lr = await fetch(p.brand.logo_url);
+        if (lr.ok) {
+          const ct = String(lr.headers.get("content-type") || "");
+          logoPath = join(dir, ct.includes("png") ? "logo.png" : "logo.img");
+          await writeFile(logoPath, Buffer.from(await lr.arrayBuffer()));
+        } else console.warn(`[job ${jobId}] logo download ${lr.status}; no watermark`);
+      } catch (e) { console.warn(`[job ${jobId}] logo fetch failed (${String(e?.message || e)}); no watermark`); }
+    }
 
     const outPath = join(dir, "out.mp4");
     const coverVf = `scale=${width}:${height}:force_original_aspect_ratio=increase:flags=bicubic,crop=${width}:${height},setsar=1`;
@@ -385,15 +406,23 @@ async function processVideoJob(p) {
       for (const s of scenePaths) { lines.push(`file '${s.file}'`); lines.push(`duration ${(Math.max(0.6, (s.end_ms - s.start_ms) / 1000)).toFixed(3)}`); }
       lines.push(`file '${scenePaths[scenePaths.length - 1].file}'`);
       await writeFile(listFile, lines.join("\n") + "\n");
-      let vf = `${coverVf},fps=30`;
-      if (assPath) vf += `,subtitles=${assPath}`;
       const a = ["-y", "-f", "concat", "-safe", "0", "-i", listFile];
       const voiceIdx = voicePath ? 1 : null;
       if (voicePath) a.push("-i", voicePath);
       const musicIdx = musicPath ? 1 + (voicePath ? 1 : 0) : null;
       if (musicPath) a.push("-i", musicPath);
+      const logoIdx = logoPath ? 1 + (voicePath ? 1 : 0) + (musicPath ? 1 : 0) : null;
+      if (logoPath) a.push("-i", logoPath);
       const total = durs.reduce((x, y) => x + y, 0);
-      const fc = [`[0:v]${vf}[vout]`];
+      const fc = [`[0:v]${coverVf},fps=30[vbase]`];
+      let lastV = "vbase";
+      if (logoIdx != null) {
+        const lw = Math.round(width * 0.14), m = Math.round(width * 0.04);
+        fc.push(`[${logoIdx}:v]scale=${lw}:-1[lg]`, `[${lastV}][lg]overlay=x=W-w-${m}:y=${m}:format=auto[vlogo]`);
+        lastV = "vlogo";
+      }
+      if (assPath) { fc.push(`[${lastV}]subtitles=${assPath}[vout]`); lastV = "vout"; }
+      else { fc.push(`[${lastV}]null[vout]`); lastV = "vout"; }
       const aout = buildAudioGraph(fc, { voiceIdx, musicIdx, total });
       a.push("-filter_complex", fc.join(";"), "-map", "[vout]");
       if (aout) a.push("-map", `[${aout}]`, "-c:a", "aac", "-b:a", "128k");
@@ -429,7 +458,7 @@ async function processVideoJob(p) {
         }
         clips.push(cp);
       }
-      await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, musicPath, assPath, T);
+      await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, musicPath, assPath, logoPath, T);
     } catch (err) {
       console.warn(`[job ${jobId}] cinematic render failed (${String(err?.message || err).slice(0, 200)}); falling back to slideshow`);
       renderStyle = "slideshow_fallback";
