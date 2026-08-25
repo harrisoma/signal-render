@@ -121,6 +121,25 @@ async function kenBurnsClip(img, outPath, durSec, w, h) {
   ]);
 }
 
+// ShotCraft's premium still treatment: one deliberate, deterministic camera
+// move per shot. It remains inside the existing Railway renderer so storage,
+// callbacks, approval, and publishing are unchanged.
+async function shotcraftClip(img, outPath, durSec, w, h, motion = "push_in") {
+  const frames = Math.max(2, Math.round(durSec * 30));
+  const zi = Math.round((w * 1.5) / 2) * 2, hi = Math.round((h * 1.5) / 2) * 2;
+  const moves = {
+    push_in: "z='min(zoom+0.0015,1.22)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+    pull_back: "z='if(eq(on,1),1.22,max(zoom-0.0015,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
+    pan_left: "z='1.12':x='min(iw-iw/zoom,on*1.5)':y='ih/2-(ih/zoom/2)'",
+    pan_right: "z='1.12':x='max(0,iw-iw/zoom-on*1.5)':y='ih/2-(ih/zoom/2)'",
+    drift_up: "z='1.12':x='iw/2-(iw/zoom/2)':y='max(0,ih-ih/zoom-on*1.2)'",
+    drift_down: "z='1.12':x='iw/2-(iw/zoom/2)':y='min(ih-ih/zoom,on*1.2)'",
+  };
+  const move = moves[motion] || moves.push_in;
+  const vf = `scale=${zi}:${hi}:force_original_aspect_ratio=increase,crop=${zi}:${hi},zoompan=${move}:d=${frames}:s=${w}x${h}:fps=30,setsar=1,format=yuv420p`;
+  await runFfmpeg(["-y", "-i", img, "-vf", vf, "-frames:v", String(frames), "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "19", outPath]);
+}
+
 // One clip from real stock footage: cover-crop to target, 30fps, freeze-pad the
 // last frame if the source runs short, hard-cap at the scene duration.
 async function stockClip(src, outPath, durSec, w, h) {
@@ -153,7 +172,7 @@ function buildAudioGraph(fc, { voiceIdx, musicIdx, total }) {
 
 // Join scene clips with crossfades; optionally brand-logo watermark, burned
 // captions, and voiceover/music mux.
-async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, assPath, logoPath, T) {
+async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, assPath, logoPath, T, transitions = []) {
   const n = clips.length;
   const args = ["-y"];
   clips.forEach((c) => args.push("-i", c));
@@ -171,7 +190,8 @@ async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, a
     for (let k = 1; k < n; k++) {
       const off = Math.max(0, acc - T);
       const out = `vx${k}`;
-      fc.push(`[${prev}][${k}:v]xfade=transition=fade:duration=${T.toFixed(3)}:offset=${off.toFixed(3)}[${out}]`);
+      const transition = ["fade", "smoothleft", "smoothright", "circleopen", "fadeblack"].includes(transitions[k - 1]) ? transitions[k - 1] : "fade";
+      fc.push(`[${prev}][${k}:v]xfade=transition=${transition}:duration=${T.toFixed(3)}:offset=${off.toFixed(3)}[${out}]`);
       acc = acc + durs[k] - T;
       prev = out;
     }
@@ -448,7 +468,8 @@ async function processVideoJob(p) {
 
     // Cinematic: per-scene Ken-Burns clips joined with crossfades. Falls back to
     // the simple path on any ffmpeg error so a render never fails outright.
-    let renderStyle = "cinematic";
+    const requestedShotcraft = p.render_style === "shotcraft";
+    let renderStyle = requestedShotcraft ? "shotcraft" : "cinematic";
     try {
       // Each crossfade overlaps adjacent clips by T, shortening the timeline by
       // T*(n-1). Pad every clip except the last by T so the assembled video runs
@@ -464,14 +485,17 @@ async function processVideoJob(p) {
             await stockClip(scenePaths[i].videoFile, cp, clipDurs[i], width, height);
           } catch (e) {
             console.warn(`[job ${jobId}] scene ${scenePaths[i].idx} stock clip failed (${String(e?.message || e).slice(0, 120)}); Ken Burns fallback`);
-            await kenBurnsClip(scenePaths[i].file, cp, clipDurs[i], width, height);
+            if (requestedShotcraft) await shotcraftClip(scenePaths[i].file, cp, clipDurs[i], width, height, scenes[i]?.shotcraft_motion);
+            else await kenBurnsClip(scenePaths[i].file, cp, clipDurs[i], width, height);
           }
         } else {
-          await kenBurnsClip(scenePaths[i].file, cp, clipDurs[i], width, height);
+          if (requestedShotcraft) await shotcraftClip(scenePaths[i].file, cp, clipDurs[i], width, height, scenes[i]?.shotcraft_motion);
+          else await kenBurnsClip(scenePaths[i].file, cp, clipDurs[i], width, height);
         }
         clips.push(cp);
       }
-      await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, musicPath, assPath, logoPath, T);
+      const transitions = requestedShotcraft ? scenes.map((s) => s.shotcraft_transition) : [];
+      await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, musicPath, assPath, logoPath, T, transitions);
     } catch (err) {
       console.warn(`[job ${jobId}] cinematic render failed (${String(err?.message || err).slice(0, 200)}); falling back to slideshow`);
       renderStyle = "slideshow_fallback";
@@ -538,6 +562,8 @@ async function processVideoJob(p) {
         has_audio: Boolean(voicePath || musicPath),
         voiceover_included: Boolean(voicePath),
         music_included: Boolean(musicPath),
+        render_style: renderStyle,
+        shotcraft_version: requestedShotcraft ? "video-shotcraft-v1" : null,
       },
     });
 
