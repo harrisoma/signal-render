@@ -361,14 +361,22 @@ async function processVideoJob(p) {
     const [width, height] = fmtDims(p.format);
     const durs = scenePaths.map((s) => Math.max(0.6, (s.end_ms - s.start_ms) / 1000));
 
-    // --- shared: optional voiceover (coordinator TTS) + caption track ---
+    // --- shared: voiceover (coordinator TTS) + caption track ---
+    // When audio is enabled, fail closed: publishing a silent substitute is worse
+    // than surfacing a retryable render error.
     let voicePath = null;
+    if (p.voiceover_enabled && !p.voiceover_url) {
+      throw new Error("voiceover enabled but voiceover_url is missing");
+    }
     if (p.voiceover_url) {
       try {
         const vr = await fetch(p.voiceover_url);
         if (vr.ok) { voicePath = join(dir, "voice.mp3"); await writeFile(voicePath, Buffer.from(await vr.arrayBuffer())); }
-        else console.warn(`[job ${jobId}] voiceover download ${vr.status}; silent`);
-      } catch (e) { console.warn(`[job ${jobId}] voiceover fetch failed (${String(e?.message || e)}); silent`); }
+        else throw new Error(`voiceover download ${vr.status}`);
+      } catch (e) {
+        if (p.voiceover_enabled) throw new Error(`required voiceover fetch failed: ${String(e?.message || e)}`);
+        console.warn(`[job ${jobId}] optional voiceover fetch failed (${String(e?.message || e)})`);
+      }
     }
     let assPath = null;
     if (p.captions_enabled && sorted.some((s) => s.on_screen_text && String(s.on_screen_text).trim())) {
@@ -376,12 +384,17 @@ async function processVideoJob(p) {
       await writeFile(assPath, buildAss(sorted, width, height));
     }
     let musicPath = null;
+    if (p.music_enabled !== false && !p.music_url) {
+      throw new Error("music enabled but music_url is missing");
+    }
     if (p.music_enabled !== false && p.music_url) {
       try {
         const mr = await fetch(p.music_url);
         if (mr.ok) { musicPath = join(dir, "music.mp3"); await writeFile(musicPath, Buffer.from(await mr.arrayBuffer())); }
-        else console.warn(`[job ${jobId}] music download ${mr.status}; silent bed`);
-      } catch (e) { console.warn(`[job ${jobId}] music fetch failed (${String(e?.message || e)}); silent bed`); }
+        else throw new Error(`music download ${mr.status}`);
+      } catch (e) {
+        throw new Error(`required music fetch failed: ${String(e?.message || e)}`);
+      }
     }
     // Brand logo watermark (best-effort; PNG alpha honored by overlay).
     let logoPath = null;
@@ -519,7 +532,13 @@ async function processVideoJob(p) {
         size_bytes: stT.size,
         content_type: "image/jpeg",
       },
-      worker_meta: { ffmpeg_version: version },
+      has_audio: Boolean(voicePath || musicPath),
+      worker_meta: {
+        ffmpeg_version: version,
+        has_audio: Boolean(voicePath || musicPath),
+        voiceover_included: Boolean(voicePath),
+        music_included: Boolean(musicPath),
+      },
     });
 
     jobs.set(jobId, { status: "done" });
