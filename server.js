@@ -81,7 +81,7 @@ function buildAss(scenes, width, height) {
 ScriptType: v4.00+
 PlayResX: ${width}
 PlayResY: ${height}
-WrapStyle: 2
+WrapStyle: 0
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
@@ -234,6 +234,45 @@ function probeDuration(file) {
   });
 }
 
+function probeHasAudio(file) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(FFPROBE, [
+      "-v", "error", "-select_streams", "a:0",
+      "-show_entries", "stream=index", "-of", "csv=p=0", file,
+    ]);
+    let out = "";
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.on("error", reject);
+    p.on("exit", (code) => {
+      if (code !== 0) return reject(new Error("ffprobe audio stream check failed"));
+      resolve(Boolean(out.trim()));
+    });
+  });
+}
+
+// Correct modest TTS pacing drift so narration reaches the end of the content.
+// Drastically short scripts fail rather than publishing a long silent tail.
+async function fitVoiceoverToTimeline(dir, voicePath, totalSec) {
+  const originalSec = await probeDuration(voicePath);
+  if (!Number.isFinite(originalSec) || originalSec <= 0) throw new Error("voiceover duration is invalid");
+  const coverage = originalSec / totalSec;
+  if (coverage < 0.55) {
+    throw new Error(`narration covers only ${Math.round(coverage * 100)}% of the video; regenerate the script before publishing`);
+  }
+  if (coverage >= 0.9) return { path: voicePath, originalSec, adjustedSec: originalSec, adjusted: false, coverage };
+  const desiredSec = totalSec * 0.96;
+  const tempo = originalSec / desiredSec;
+  if (tempo < 0.5 || tempo > 2) throw new Error(`narration pacing correction ${tempo.toFixed(3)} is outside the safe range`);
+  const fittedPath = join(dir, "voice-fitted.mp3");
+  await runFfmpeg([
+    "-y", "-i", voicePath,
+    "-filter:a", `atempo=${tempo.toFixed(5)},apad,atrim=0:${totalSec.toFixed(3)}`,
+    "-c:a", "libmp3lame", "-b:a", "160k", fittedPath,
+  ]);
+  const adjustedSec = await probeDuration(fittedPath);
+  return { path: fittedPath, originalSec, adjustedSec, adjusted: true, coverage };
+}
+
 function auth(req, res, next) {
   const h = (req.headers.authorization || "").replace(/^Bearer\s+/i, "");
   if (!RENDER_TOKEN || h !== RENDER_TOKEN) {
@@ -282,6 +321,7 @@ function validateVideoPayload(p) {
   if (!Array.isArray(p.scenes) || p.scenes.length !== p.expected_scene_count) {
     return "scene count mismatch";
   }
+  if (!p?.brand?.logo_url) return "missing required brand logo_url";
   if (p.scenes.some((s) => !s?.image_url && !s?.video_url)) return "one or more scenes missing image_url/video_url";
   return null;
 }
@@ -365,6 +405,7 @@ async function processVideoJob(p) {
     // When audio is enabled, fail closed: publishing a silent substitute is worse
     // than surfacing a retryable render error.
     let voicePath = null;
+    let voiceMeta = null;
     if (p.voiceover_enabled && !p.voiceover_url) {
       throw new Error("voiceover enabled but voiceover_url is missing");
     }
@@ -377,6 +418,10 @@ async function processVideoJob(p) {
         if (p.voiceover_enabled) throw new Error(`required voiceover fetch failed: ${String(e?.message || e)}`);
         console.warn(`[job ${jobId}] optional voiceover fetch failed (${String(e?.message || e)})`);
       }
+    }
+    if (voicePath) {
+      voiceMeta = await fitVoiceoverToTimeline(dir, voicePath, durs.reduce((a, b) => a + b, 0));
+      voicePath = voiceMeta.path;
     }
     let assPath = null;
     if (p.captions_enabled && sorted.some((s) => s.on_screen_text && String(s.on_screen_text).trim())) {
@@ -405,8 +450,8 @@ async function processVideoJob(p) {
           const ct = String(lr.headers.get("content-type") || "");
           logoPath = join(dir, ct.includes("png") ? "logo.png" : "logo.img");
           await writeFile(logoPath, Buffer.from(await lr.arrayBuffer()));
-        } else console.warn(`[job ${jobId}] logo download ${lr.status}; no watermark`);
-      } catch (e) { console.warn(`[job ${jobId}] logo fetch failed (${String(e?.message || e)}); no watermark`); }
+        } else throw new Error(`required logo download ${lr.status}`);
+      } catch (e) { throw new Error(`required brand logo fetch failed: ${String(e?.message || e)}`); }
     }
 
     const outPath = join(dir, "out.mp4");
@@ -479,6 +524,11 @@ async function processVideoJob(p) {
     }
     console.log(`[job ${jobId}] render style: ${renderStyle}`);
 
+    const hasAudio = await probeHasAudio(outPath);
+    if ((p.voiceover_enabled || p.music_enabled) && !hasAudio) {
+      throw new Error("final MP4 is missing the required audio stream");
+    }
+
     // 4. Thumbnail from first scene
     const thumbPath = join(dir, "thumb.jpg");
     await runFfmpeg([
@@ -532,12 +582,16 @@ async function processVideoJob(p) {
         size_bytes: stT.size,
         content_type: "image/jpeg",
       },
-      has_audio: Boolean(voicePath || musicPath),
+      has_audio: hasAudio,
       worker_meta: {
         ffmpeg_version: version,
-        has_audio: Boolean(voicePath || musicPath),
+        has_audio: hasAudio,
         voiceover_included: Boolean(voicePath),
         music_included: Boolean(musicPath),
+        voiceover_original_sec: voiceMeta?.originalSec ?? null,
+        voiceover_adjusted_sec: voiceMeta?.adjustedSec ?? null,
+        voiceover_timing_adjusted: voiceMeta?.adjusted ?? false,
+        voiceover_coverage_ratio: voiceMeta?.coverage ?? null,
       },
     });
 
