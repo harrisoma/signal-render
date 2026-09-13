@@ -14,6 +14,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, writeFile, readFile, stat, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import puppeteer from "puppeteer-core";
 
 // ffmpeg/ffprobe resolution: prefer the bundled static binaries so the worker
 // renders under any Railway builder (Nixpacks/Railpack images ship no ffmpeg);
@@ -33,6 +34,13 @@ const app = express();
 app.use(express.json({ limit: "5mb" }));
 
 const RENDER_TOKEN = process.env.RENDER_TOKEN;
+// Separate, lower-stakes secret for /render-html so callers that only need a
+// PNG from HTML don't need the same token that authorizes video jobs and
+// signed-upload callbacks. Optional: if unset, /render-html is open (matches
+// the free public render APIs it replaces — e.g. PageShot — which shipped
+// with no auth at all).
+const HTML_RENDER_TOKEN = process.env.RENDER_HTML_TOKEN;
+const CHROMIUM_PATH = process.env.CHROMIUM_PATH || "/usr/bin/chromium";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const PORT = Number(process.env.PORT || 8080);
 const STATUS_ENDPOINT = SUPABASE_URL
@@ -281,6 +289,46 @@ function auth(req, res, next) {
   next();
 }
 
+function htmlAuth(req, res, next) {
+  if (!HTML_RENDER_TOKEN) return next(); // no token configured -> open, same as before
+  const h = req.headers["x-render-token"];
+  if (h !== HTML_RENDER_TOKEN) return res.status(401).json({ error: "unauthorized" });
+  next();
+}
+
+// One shared headless Chromium instance, launched lazily on first use and
+// reused across requests (each request gets its own page/tab). Relaunches
+// automatically if the browser process ever dies.
+let browserPromise = null;
+async function getBrowser() {
+  if (browserPromise) {
+    const existing = await browserPromise;
+    if (existing.connected) return existing;
+    browserPromise = null;
+  }
+  browserPromise = puppeteer
+    .launch({
+      executablePath: CHROMIUM_PATH,
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    })
+    .catch((err) => {
+      browserPromise = null;
+      throw err;
+    });
+  return browserPromise;
+}
+
+// Cheap existence/version check, not a full browser launch — health checks
+// may be polled often and shouldn't pay Chromium's ~1-2s startup cost.
+function hasChromium() {
+  return new Promise((resolve) => {
+    const p = spawn(CHROMIUM_PATH, ["--version"]);
+    p.on("error", () => resolve(false));
+    p.on("exit", (code) => resolve(code === 0));
+  });
+}
+
 function countByStatus(status) {
   let n = 0;
   for (const j of jobs.values()) if (j.status === status) n++;
@@ -327,15 +375,60 @@ function validateVideoPayload(p) {
 }
 
 app.get("/health", async (_req, res) => {
-  const ffmpegOk = await hasFfmpeg();
+  const [ffmpegOk, chromiumOk] = await Promise.all([hasFfmpeg(), hasChromium()]);
   res.json({
     ok: true,
     static_render: true,
     video_render: Boolean(ffmpegOk && RENDER_TOKEN),
+    html_render: chromiumOk,
+    html_render_auth_required: Boolean(HTML_RENDER_TOKEN),
     status_endpoint_configured: Boolean(STATUS_ENDPOINT),
     active_video_jobs: countByStatus("rendering"),
     queued_video_jobs: countByStatus("queued"),
   });
+});
+
+// HTML/CSS -> PNG (or JPEG) rendering, e.g. for social-post stills built from
+// a template. Replaces the previous dependency on the free pageshot.site API,
+// which was failing under its own load (timeouts and 503 SERVER_BUSY) —
+// see TWIN workflow debugging, Sep 2026.
+app.post("/render-html", htmlAuth, async (req, res) => {
+  const { html, width, height, format, device_scale } = req.body || {};
+  if (typeof html !== "string" || !html.trim()) {
+    return res.status(400).json({ error: "missing html (string) in body" });
+  }
+  if (html.length > 2_000_000) {
+    return res.status(400).json({ error: "html payload too large (max 2MB)" });
+  }
+  const w = Math.max(1, Math.min(4000, Math.round(Number(width) || 1080)));
+  const h = Math.max(1, Math.min(4000, Math.round(Number(height) || 1080)));
+  const scale = Math.max(1, Math.min(3, Number(device_scale) || 1));
+  const type = format === "jpeg" || format === "jpg" ? "jpeg" : "png";
+
+  let page = null;
+  try {
+    const browser = await getBrowser();
+    page = await browser.newPage();
+    await page.setViewport({ width: w, height: h, deviceScaleFactor: scale });
+    // networkidle0: template pulls in Google Fonts via @import and remote
+    // <img> URLs (Supabase-hosted bot art) — wait for those to settle before
+    // screenshotting rather than racing a fixed delay.
+    await page.setContent(html, { waitUntil: "networkidle0", timeout: 20000 });
+    const buffer = await page.screenshot({
+      type,
+      ...(type === "jpeg" ? { quality: 90 } : {}),
+    });
+    res.setHeader("Content-Type", type === "png" ? "image/png" : "image/jpeg");
+    res.send(buffer);
+  } catch (err) {
+    console.error("render-html failed:", err);
+    res.status(500).json({
+      error: "render_failed",
+      message: String(err?.message || err).slice(0, 300),
+    });
+  } finally {
+    if (page) await page.close().catch(() => {});
+  }
 });
 
 // Renders run strictly one at a time — concurrent ffmpeg pipelines on a small
