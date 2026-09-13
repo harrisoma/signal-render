@@ -1,7 +1,10 @@
 # Nixpacks alternative (if Railway isn't using the Dockerfile).
 # Ensures ffmpeg/ffprobe are on PATH.
 [phases.setup]
-nixPkgs = ["nodejs_20", "ffmpeg"]
+nixPkgs = ["nodejs_20", "ffmpeg", "chromium"]
+
+[variables]
+CHROMIUM_PATH = "/usr/bin/chromium"
 
 [phases.install]
 cmds = ["npm install --omit=dev"]
