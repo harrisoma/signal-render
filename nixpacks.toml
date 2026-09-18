@@ -1,10 +1,12 @@
 # Nixpacks alternative (if Railway isn't using the Dockerfile).
-# Ensures ffmpeg/ffprobe are on PATH.
+# Ensures ffmpeg/ffprobe and chromium are on PATH. Nix installs chromium under
+# /nix/store, not /usr/bin, so CHROMIUM_PATH is deliberately NOT set here —
+# server.js resolves the binary from PATH at boot.
 [phases.setup]
-nixPkgs = ["nodejs_20", "ffmpeg"]
+nixPkgs = ["nodejs_20", "ffmpeg", "chromium"]
 
 [phases.install]
-cmds = ["npm install --omit=dev"]
+cmds = ["npm ci --omit=dev"]
 
 [start]
 cmd = "node server.js"

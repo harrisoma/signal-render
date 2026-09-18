@@ -4,16 +4,25 @@
 // never holds the service role key.
 //
 // Env:
-//   RENDER_TOKEN   (required) — shared secret, used as bearer for status callbacks
-//                               and to authenticate inbound /render-video requests.
-//   SUPABASE_URL   (required) — used to build the status callback endpoint.
-//   PORT           (default 8080)
+//   RENDER_TOKEN          (required) — shared secret, used as bearer for status callbacks
+//                                      and to authenticate inbound /render-video and /render.
+//   SUPABASE_URL          (required) — used to build the status callback endpoint.
+//   RENDER_HTML_TOKEN     (optional) — separate secret for /render-html; open when unset.
+//   CHROMIUM_PATH         (optional) — chromium binary; resolved from PATH when unset.
+//   MAX_HTML_CONCURRENCY  (default 2) — simultaneous Chromium pages across /render + /render-html.
+//   PORT                  (default 8080)
 
 import express from "express";
 import { spawn } from "node:child_process";
-import { mkdtemp, writeFile, readFile, stat, rm } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, readdir, stat, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname, delimiter as PATH_DELIM } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import puppeteer from "puppeteer-core";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const TEMPLATES_DIR = join(__dirname, "templates");
 
 // ffmpeg/ffprobe resolution: prefer the bundled static binaries so the worker
 // renders under any Railway builder (Nixpacks/Railpack images ship no ffmpeg);
@@ -33,14 +42,82 @@ const app = express();
 app.use(express.json({ limit: "5mb" }));
 
 const RENDER_TOKEN = process.env.RENDER_TOKEN;
+// Separate, lower-stakes secret for /render-html so callers that only need a
+// PNG from HTML don't need the same token that authorizes video jobs and
+// signed-upload callbacks. Optional: if unset, /render-html is open (matches
+// the free public render APIs it replaces — e.g. PageShot — which shipped
+// with no auth at all).
+const HTML_RENDER_TOKEN = process.env.RENDER_HTML_TOKEN;
+// Chromium binary: honor CHROMIUM_PATH when it points at a real file, else
+// search PATH (Nixpacks puts it in /nix/store, Debian at /usr/bin). puppeteer
+// requires an absolute path that exists, so a bare "chromium" is resolved here.
+function resolveChromium() {
+  const candidates = [process.env.CHROMIUM_PATH, "/usr/bin/chromium", "/usr/bin/chromium-browser"].filter(Boolean);
+  for (const c of candidates) if (existsSync(c)) return c;
+  for (const dir of (process.env.PATH || "").split(PATH_DELIM)) {
+    for (const name of ["chromium", "chromium-browser", "google-chrome"]) {
+      const full = join(dir, name);
+      if (dir && existsSync(full)) return full;
+    }
+  }
+  return process.env.CHROMIUM_PATH || "/usr/bin/chromium";
+}
+const CHROMIUM_PATH = resolveChromium();
+// Chromium pages are memory-heavy and share one small vCPU with ffmpeg; cap
+// how many render at once and queue the rest instead of letting a burst of
+// requests OOM the container (which would take video rendering down with it).
+const MAX_HTML_CONCURRENCY = Math.max(1, Number(process.env.MAX_HTML_CONCURRENCY) || 2);
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const PORT = Number(process.env.PORT || 8080);
 const STATUS_ENDPOINT = SUPABASE_URL
   ? `${SUPABASE_URL.replace(/\/$/, "")}/functions/v1/signal-video-complete`
   : null;
 
-/** @type {Map<string, { status: "queued"|"rendering"|"done"|"failed" }>} */
+/** @type {Map<string, { status: "queued"|"rendering"|"done"|"failed", finished_at?: number }>} */
 const jobs = new Map();
+// Terminal jobs are kept an hour so UI retries still dedupe, then dropped.
+const JOB_TTL_MS = 60 * 60 * 1000;
+setInterval(() => {
+  const cutoff = Date.now() - JOB_TTL_MS;
+  for (const [id, j] of jobs) if (j.finished_at && j.finished_at < cutoff) jobs.delete(id);
+}, 5 * 60 * 1000).unref();
+
+// Every network call and every ffmpeg invocation is bounded. Renders run
+// serially, so one hung download or encode would otherwise block every job
+// behind it until the container was restarted.
+const TIMEOUTS = {
+  asset_fetch_ms: 60_000,     // scene stills / stock clips / voiceover / music / logo
+  upload_ms: 180_000,         // signed PUT of the finished MP4
+  status_ms: 15_000,          // callback to signal-video-complete
+  ffmpeg_ms: 10 * 60_000,     // any single ffmpeg pass
+  ffprobe_ms: 30_000,
+  html_render_ms: 20_000,     // page load + assets for /render and /render-html
+};
+
+function fetchWithTimeout(url, opts = {}, ms = TIMEOUTS.asset_fetch_ms) {
+  return fetch(url, { ...opts, signal: AbortSignal.timeout(ms) });
+}
+
+// Tiny counting semaphore for Chromium pages.
+function makeSemaphore(n) {
+  let active = 0;
+  const waiters = [];
+  return {
+    get active() { return active; },
+    get waiting() { return waiters.length; },
+    async acquire() {
+      if (active < n) { active++; return; }
+      await new Promise((resolve) => waiters.push(resolve));
+      active++;
+    },
+    release() {
+      active--;
+      const next = waiters.shift();
+      if (next) next();
+    },
+  };
+}
+const pageSlots = makeSemaphore(MAX_HTML_CONCURRENCY);
 
 function hasFfmpeg() {
   return new Promise((resolve) => {
@@ -201,53 +278,51 @@ async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, a
   await runFfmpeg(args);
 }
 
-function runFfmpeg(args) {
+function runFfmpeg(args, timeoutMs = TIMEOUTS.ffmpeg_ms) {
   return new Promise((resolve, reject) => {
     const p = spawn(FFMPEG, args);
     let stderr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; p.kill("SIGKILL"); }, timeoutMs);
     p.stderr.on("data", (d) => (stderr += d.toString()));
-    p.on("error", reject);
+    p.on("error", (e) => { clearTimeout(timer); reject(e); });
     p.on("exit", (code) => {
+      clearTimeout(timer);
+      if (timedOut) return reject(new Error(`ffmpeg killed after ${Math.round(timeoutMs / 1000)}s: ${stderr.slice(-300)}`));
       if (code === 0) resolve();
       else reject(new Error(`ffmpeg exit ${code}: ${stderr.slice(-400)}`));
     });
   });
 }
 
-function probeDuration(file) {
+// ffprobe with a hard cap; ffprobe on a truncated/corrupt file can hang.
+function runFfprobe(args) {
   return new Promise((resolve, reject) => {
-    const p = spawn(FFPROBE, [
-      "-v", "error",
-      "-show_entries", "format=duration",
-      "-of", "default=nk=1:nw=1",
-      file,
-    ]);
+    const p = spawn(FFPROBE, args);
     let out = "";
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; p.kill("SIGKILL"); }, TIMEOUTS.ffprobe_ms);
     p.stdout.on("data", (d) => (out += d.toString()));
-    p.on("error", reject);
+    p.on("error", (e) => { clearTimeout(timer); reject(e); });
     p.on("exit", (code) => {
+      clearTimeout(timer);
+      if (timedOut) return reject(new Error("ffprobe timed out"));
       if (code !== 0) return reject(new Error("ffprobe failed"));
-      const n = Number(out.trim());
-      if (!Number.isFinite(n)) return reject(new Error("ffprobe non-numeric"));
-      resolve(n);
+      resolve(out);
     });
   });
 }
 
-function probeHasAudio(file) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(FFPROBE, [
-      "-v", "error", "-select_streams", "a:0",
-      "-show_entries", "stream=index", "-of", "csv=p=0", file,
-    ]);
-    let out = "";
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.on("error", reject);
-    p.on("exit", (code) => {
-      if (code !== 0) return reject(new Error("ffprobe audio stream check failed"));
-      resolve(Boolean(out.trim()));
-    });
-  });
+async function probeDuration(file) {
+  const out = await runFfprobe(["-v", "error", "-show_entries", "format=duration", "-of", "default=nk=1:nw=1", file]);
+  const n = Number(out.trim());
+  if (!Number.isFinite(n)) throw new Error("ffprobe non-numeric");
+  return n;
+}
+
+async function probeHasAudio(file) {
+  const out = await runFfprobe(["-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index", "-of", "csv=p=0", file]);
+  return Boolean(out.trim());
 }
 
 // Correct modest TTS pacing drift so narration reaches the end of the content.
@@ -281,6 +356,46 @@ function auth(req, res, next) {
   next();
 }
 
+function htmlAuth(req, res, next) {
+  if (!HTML_RENDER_TOKEN) return next(); // no token configured -> open, same as before
+  const h = req.headers["x-render-token"];
+  if (h !== HTML_RENDER_TOKEN) return res.status(401).json({ error: "unauthorized" });
+  next();
+}
+
+// One shared headless Chromium instance, launched lazily on first use and
+// reused across requests (each request gets its own page/tab). Relaunches
+// automatically if the browser process ever dies.
+let browserPromise = null;
+async function getBrowser() {
+  if (browserPromise) {
+    const existing = await browserPromise;
+    if (existing.connected) return existing;
+    browserPromise = null;
+  }
+  browserPromise = puppeteer
+    .launch({
+      executablePath: CHROMIUM_PATH,
+      headless: true,
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+    })
+    .catch((err) => {
+      browserPromise = null;
+      throw err;
+    });
+  return browserPromise;
+}
+
+// Cheap existence/version check, not a full browser launch — health checks
+// may be polled often and shouldn't pay Chromium's ~1-2s startup cost.
+function hasChromium() {
+  return new Promise((resolve) => {
+    const p = spawn(CHROMIUM_PATH, ["--version"]);
+    p.on("error", () => resolve(false));
+    p.on("exit", (code) => resolve(code === 0));
+  });
+}
+
 function countByStatus(status) {
   let n = 0;
   for (const j of jobs.values()) if (j.status === status) n++;
@@ -293,14 +408,14 @@ async function reportStatus(jobId, projectId, patch) {
     return;
   }
   try {
-    const r = await fetch(STATUS_ENDPOINT, {
+    const r = await fetchWithTimeout(STATUS_ENDPOINT, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${RENDER_TOKEN}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ job_id: jobId, project_id: projectId, patch }),
-    });
+    }, TIMEOUTS.status_ms);
     if (!r.ok) {
       const text = await r.text().catch(() => "");
       console.error(`[job ${jobId}] status ${r.status}: ${text.slice(0, 200)}`);
@@ -327,15 +442,146 @@ function validateVideoPayload(p) {
 }
 
 app.get("/health", async (_req, res) => {
-  const ffmpegOk = await hasFfmpeg();
+  const [ffmpegOk, chromiumOk, templates] = await Promise.all([hasFfmpeg(), hasChromium(), listTemplates()]);
   res.json({
     ok: true,
-    static_render: true,
+    // /render needs Chromium AND the templates directory shipped in the image.
+    static_render: Boolean(chromiumOk && RENDER_TOKEN && templates.length > 0),
+    templates,
     video_render: Boolean(ffmpegOk && RENDER_TOKEN),
+    html_render: chromiumOk,
+    html_render_auth_required: Boolean(HTML_RENDER_TOKEN),
+    html_render_max_concurrency: MAX_HTML_CONCURRENCY,
+    html_render_active: pageSlots.active,
     status_endpoint_configured: Boolean(STATUS_ENDPOINT),
     active_video_jobs: countByStatus("rendering"),
     queued_video_jobs: countByStatus("queued"),
   });
+});
+
+async function listTemplates() {
+  try {
+    const entries = await readdir(TEMPLATES_DIR, { withFileTypes: true });
+    return entries.filter((d) => d.isDirectory() && existsSync(join(TEMPLATES_DIR, d.name, "index.html"))).map((d) => d.name).sort();
+  } catch {
+    return [];
+  }
+}
+
+app.get("/templates", auth, async (_req, res) => {
+  res.json({ templates: await listTemplates() });
+});
+
+// Template -> branded PNG/JPEG. Called by the signal-render-template and
+// signal-render-carousel edge functions with { template, params } and bearer
+// RENDER_TOKEN. Templates read params from the query string, load their own
+// fonts/logos, and flip body.dataset.ready="1" (+ dataset.imgStatus) when done.
+app.post("/render", auth, async (req, res) => {
+  const { template = "master", width = 1080, height = 1080, format = "png", params = {}, strictLogos } = req.body || {};
+  const safeName = String(template).replace(/[^a-zA-Z0-9_-]/g, "");
+  const templateFile = join(TEMPLATES_DIR, safeName, "index.html");
+  if (!safeName || !existsSync(templateFile)) {
+    return res.status(404).json({ error: `template not found: ${safeName}` });
+  }
+  if (params && typeof params !== "object") return res.status(400).json({ error: "params must be an object" });
+
+  const qs = new URLSearchParams();
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value !== undefined && value !== null) qs.set(key, String(value));
+  }
+  const fileUrl = `${pathToFileURL(templateFile).href}?${qs.toString()}`;
+  const w = Math.max(1, Math.min(4000, Math.round(Number(width) || 1080)));
+  const h = Math.max(1, Math.min(4000, Math.round(Number(height) || 1080)));
+  const type = format === "jpeg" || format === "jpg" ? "jpeg" : "png";
+
+  let page = null;
+  await pageSlots.acquire();
+  try {
+    const browser = await getBrowser();
+    page = await browser.newPage();
+    await page.setViewport({ width: w, height: h, deviceScaleFactor: 2 });
+    await page.goto(fileUrl, { waitUntil: "domcontentloaded", timeout: TIMEOUTS.html_render_ms });
+
+    try {
+      await page.waitForFunction(() => document.body.dataset.ready === "1", { timeout: TIMEOUTS.html_render_ms });
+    } catch {
+      return res.status(504).json({ error: "render timed out waiting for assets (logo/font may be unreachable)" });
+    }
+
+    const imgStatus = await page.evaluate(() => {
+      try { return JSON.parse(document.body.dataset.imgStatus || "{}"); } catch { return {}; }
+    });
+    const failed = Object.entries(imgStatus).filter(([, v]) => v === "fail").map(([k]) => k);
+    if (strictLogos !== false && failed.length) {
+      return res.status(422).json({
+        error: "image(s) failed to load",
+        failed,
+        imgStatus,
+        hint: "check the signed URL(s); post was NOT rendered to avoid a broken image",
+      });
+    }
+
+    await new Promise((r) => setTimeout(r, 150));
+    const el = (await page.$(".canvas")) || page;
+    const buffer = await el.screenshot({ type, ...(type === "jpeg" ? { quality: 92 } : {}) });
+    res.setHeader("Content-Type", type === "png" ? "image/png" : "image/jpeg");
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Img-Status", JSON.stringify(imgStatus));
+    // puppeteer >= 22 returns a Uint8Array; express would JSON-serialize that.
+    res.send(Buffer.from(buffer));
+  } catch (err) {
+    console.error("[render] failed:", err);
+    res.status(500).json({ error: "render_failed", message: String(err?.message || err).slice(0, 300) });
+  } finally {
+    if (page) await page.close().catch(() => {});
+    pageSlots.release();
+  }
+});
+
+// HTML/CSS -> PNG (or JPEG) rendering, e.g. for social-post stills built from
+// a template. Replaces the previous dependency on the free pageshot.site API,
+// which was failing under its own load (timeouts and 503 SERVER_BUSY) —
+// see TWIN workflow debugging, Sep 2026.
+app.post("/render-html", htmlAuth, async (req, res) => {
+  const { html, width, height, format, device_scale } = req.body || {};
+  if (typeof html !== "string" || !html.trim()) {
+    return res.status(400).json({ error: "missing html (string) in body" });
+  }
+  if (html.length > 2_000_000) {
+    return res.status(400).json({ error: "html payload too large (max 2MB)" });
+  }
+  const w = Math.max(1, Math.min(4000, Math.round(Number(width) || 1080)));
+  const h = Math.max(1, Math.min(4000, Math.round(Number(height) || 1080)));
+  const scale = Math.max(1, Math.min(3, Number(device_scale) || 1));
+  const type = format === "jpeg" || format === "jpg" ? "jpeg" : "png";
+
+  let page = null;
+  await pageSlots.acquire();
+  try {
+    const browser = await getBrowser();
+    page = await browser.newPage();
+    await page.setViewport({ width: w, height: h, deviceScaleFactor: scale });
+    // networkidle0: template pulls in Google Fonts via @import and remote
+    // <img> URLs (Supabase-hosted bot art) — wait for those to settle before
+    // screenshotting rather than racing a fixed delay.
+    await page.setContent(html, { waitUntil: "networkidle0", timeout: TIMEOUTS.html_render_ms });
+    const buffer = await page.screenshot({
+      type,
+      ...(type === "jpeg" ? { quality: 90 } : {}),
+    });
+    res.setHeader("Content-Type", type === "png" ? "image/png" : "image/jpeg");
+    // puppeteer >= 22 returns a Uint8Array; express would JSON-serialize that.
+    res.send(Buffer.from(buffer));
+  } catch (err) {
+    console.error("render-html failed:", err);
+    res.status(500).json({
+      error: "render_failed",
+      message: String(err?.message || err).slice(0, 300),
+    });
+  } finally {
+    if (page) await page.close().catch(() => {});
+    pageSlots.release();
+  }
 });
 
 // Renders run strictly one at a time — concurrent ffmpeg pipelines on a small
@@ -379,14 +625,14 @@ async function processVideoJob(p) {
     const sorted = [...p.scenes].sort((a, b) => a.idx - b.idx);
     const scenePaths = [];
     for (const s of sorted) {
-      const r = await fetch(s.image_url);
+      const r = await fetchWithTimeout(s.image_url);
       if (!r.ok) throw new Error(`scene ${s.idx} download ${r.status}`);
       const file = join(dir, `scene-${s.idx}.jpg`);
       await writeFile(file, Buffer.from(await r.arrayBuffer()));
       let videoFile = null;
       if (s.video_url) {
         try {
-          const vr = await fetch(s.video_url);
+          const vr = await fetchWithTimeout(s.video_url);
           if (vr.ok) { videoFile = join(dir, `scene-${s.idx}.mp4`); await writeFile(videoFile, Buffer.from(await vr.arrayBuffer())); }
           else console.warn(`[job ${jobId}] scene ${s.idx} stock video ${vr.status}; using still`);
         } catch (e) { console.warn(`[job ${jobId}] scene ${s.idx} stock fetch failed (${String(e?.message || e)}); using still`); }
@@ -411,7 +657,7 @@ async function processVideoJob(p) {
     }
     if (p.voiceover_url) {
       try {
-        const vr = await fetch(p.voiceover_url);
+        const vr = await fetchWithTimeout(p.voiceover_url);
         if (vr.ok) { voicePath = join(dir, "voice.mp3"); await writeFile(voicePath, Buffer.from(await vr.arrayBuffer())); }
         else throw new Error(`voiceover download ${vr.status}`);
       } catch (e) {
@@ -434,7 +680,7 @@ async function processVideoJob(p) {
     }
     if (p.music_enabled !== false && p.music_url) {
       try {
-        const mr = await fetch(p.music_url);
+        const mr = await fetchWithTimeout(p.music_url);
         if (mr.ok) { musicPath = join(dir, "music.mp3"); await writeFile(musicPath, Buffer.from(await mr.arrayBuffer())); }
         else throw new Error(`music download ${mr.status}`);
       } catch (e) {
@@ -445,7 +691,7 @@ async function processVideoJob(p) {
     let logoPath = null;
     if (p.brand?.logo_url) {
       try {
-        const lr = await fetch(p.brand.logo_url);
+        const lr = await fetchWithTimeout(p.brand.logo_url);
         if (lr.ok) {
           const ct = String(lr.headers.get("content-type") || "");
           logoPath = join(dir, ct.includes("png") ? "logo.png" : "logo.img");
@@ -595,7 +841,7 @@ async function processVideoJob(p) {
       },
     });
 
-    jobs.set(jobId, { status: "done" });
+    jobs.set(jobId, { status: "done", finished_at: Date.now() });
   } catch (err) {
     const message = String(err?.message || err).slice(0, 500);
     console.error(`[job ${jobId}] failed:`, message);
@@ -604,18 +850,18 @@ async function processVideoJob(p) {
       error_reason: message,
       error: { code: "worker_error", message },
     });
-    jobs.set(jobId, { status: "failed" });
+    jobs.set(jobId, { status: "failed", finished_at: Date.now() });
   } finally {
     rm(dir, { recursive: true, force: true }).catch(() => {});
   }
 }
 
 async function putSigned(url, bytes, contentType) {
-  const r = await fetch(url, {
+  const r = await fetchWithTimeout(url, {
     method: "PUT",
     headers: { "x-upsert": "true", "Content-Type": contentType },
     body: bytes,
-  });
+  }, TIMEOUTS.upload_ms);
   if (!r.ok) {
     const body = await r.text().catch(() => "");
     throw new Error(`upload ${r.status}: ${body.slice(0, 200)}`);
