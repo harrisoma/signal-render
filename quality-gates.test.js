@@ -50,3 +50,8 @@ test("screenshots are sent as raw bytes, not JSON", () => {
   assert.equal((source.match(/res\.send\(Buffer\.from\(buffer\)\)/g) || []).length, 2);
   assert.doesNotMatch(source, /res\.send\(buffer\)/);
 });
+
+test("html render token comparison ignores surrounding whitespace", () => {
+  assert.match(source, /process\.env\.RENDER_HTML_TOKEN \|\| ""\)\.trim\(\)/);
+  assert.match(source, /req\.headers\["x-render-token"\] \|\| ""\)\.trim\(\)/);
+});

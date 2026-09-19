@@ -47,7 +47,9 @@ const RENDER_TOKEN = process.env.RENDER_TOKEN;
 // signed-upload callbacks. Optional: if unset, /render-html is open (matches
 // the free public render APIs it replaces — e.g. PageShot — which shipped
 // with no auth at all).
-const HTML_RENDER_TOKEN = process.env.RENDER_HTML_TOKEN;
+// Trimmed: tokens pasted from a terminal often carry a trailing newline, and
+// a stray "\n" on either side must not turn into a silent 401.
+const HTML_RENDER_TOKEN = (process.env.RENDER_HTML_TOKEN || "").trim() || undefined;
 // Chromium binary: honor CHROMIUM_PATH when it points at a real file, else
 // search PATH (Nixpacks puts it in /nix/store, Debian at /usr/bin). puppeteer
 // requires an absolute path that exists, so a bare "chromium" is resolved here.
@@ -358,7 +360,7 @@ function auth(req, res, next) {
 
 function htmlAuth(req, res, next) {
   if (!HTML_RENDER_TOKEN) return next(); // no token configured -> open, same as before
-  const h = req.headers["x-render-token"];
+  const h = String(req.headers["x-render-token"] || "").trim();
   if (h !== HTML_RENDER_TOKEN) return res.status(401).json({ error: "unauthorized" });
   next();
 }
