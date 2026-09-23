@@ -5,9 +5,12 @@ No Supabase client — the Edge Function mints signed GET/PUT URLs; this
 worker only downloads scenes, renders, uploads, and POSTs a callback.
 
 Render features:
-- **Cinematic motion** — each scene is a Ken-Burns clip (slow zoom) joined with
-  crossfade transitions. Falls back automatically to a timed slideshow if the
-  motion filtergraph errors, so a render never fails outright.
+- **Scene-aware still motion** — each still scene is rendered with a restrained
+  server-owned treatment such as push-in, pull-out, pan, drift, or hold, then
+  joined with clean fades/cuts/subtle directional reveals. Old payloads without
+  motion hints receive deterministic fallback variety. Falls back automatically
+  to a timed slideshow if the motion filtergraph errors, so a render never fails
+  outright.
 - **Voiceover** — if the payload includes `voiceover_url` (an MP3 the
   coordinator synthesized via TTS), it is muxed as the audio track.
 - **Captions** — if `captions_enabled` is true, per-scene `on_screen_text`

@@ -20,6 +20,13 @@ import { tmpdir } from "node:os";
 import { join, dirname, delimiter as PATH_DELIM } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import puppeteer from "puppeteer-core";
+import {
+  buildStillMotionFilter,
+  normalizeTransitionIntent,
+  planMotionTreatments,
+  planTransitions,
+  transitionDuration,
+} from "./motion-director.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = join(__dirname, "templates");
@@ -180,20 +187,15 @@ function fmtDims(fmt) {
   return f === "9:16" ? [1080, 1920] : f === "16:9" ? [1920, 1080] : [1080, 1080];
 }
 
-// One Ken-Burns clip from a still: slow centered zoom, output at target size/fps.
+// One scene-aware motion clip from a still, output at target size/fps.
 // 1.5x supersample (max zoom is 1.18, so headroom to spare) + ultrafast preset:
 // the intermediate clips are re-encoded in the assemble pass, so cheap here is
 // free quality-wise and keeps render times sane on a single shared vCPU.
-async function kenBurnsClip(img, outPath, durSec, w, h) {
-  const frames = Math.max(2, Math.round(durSec * 30));
-  const zi = Math.round((w * 1.5) / 2) * 2, hi = Math.round((h * 1.5) / 2) * 2;
+async function stillMotionClip(img, outPath, durSec, w, h, treatment = "push_in") {
+  const { frames, filter: vf } = buildStillMotionFilter(treatment, durSec, w, h);
   // The still goes in as a SINGLE frame; zoompan's d= then emits exactly
   // `frames` output frames from it. (Looping the input first multiplies the
   // output by d per duplicated input frame — hours of video per clip.)
-  const vf =
-    `scale=${zi}:${hi}:force_original_aspect_ratio=increase,crop=${zi}:${hi},` +
-    `zoompan=z='min(zoom+0.0012,1.18)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${w}x${h}:fps=30,` +
-    `setsar=1,format=yuv420p`;
   await runFfmpeg([
     "-y", "-i", img, "-vf", vf, "-frames:v", String(frames),
     "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", outPath,
@@ -230,9 +232,9 @@ function buildAudioGraph(fc, { voiceIdx, musicIdx, total }) {
   return null;
 }
 
-// Join scene clips with crossfades; optionally brand-logo watermark, burned
+// Join scene clips with restrained transitions; optionally brand-logo watermark, burned
 // captions, and voiceover/music mux.
-async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, assPath, logoPath, T) {
+async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, assPath, logoPath, transitionPlan = []) {
   const n = clips.length;
   const args = ["-y"];
   clips.forEach((c) => args.push("-i", c));
@@ -245,15 +247,24 @@ async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, a
 
   const fc = [];
   let last = "0:v";
+  let total = durs[0] || 0;
   if (n > 1) {
     let acc = durs[0], prev = "0:v";
     for (let k = 1; k < n; k++) {
-      const off = Math.max(0, acc - T);
       const out = `vx${k}`;
-      fc.push(`[${prev}][${k}:v]xfade=transition=fade:duration=${T.toFixed(3)}:offset=${off.toFixed(3)}[${out}]`);
-      acc = acc + durs[k] - T;
+      const transition = normalizeTransitionIntent(transitionPlan[k - 1]?.transition) || "fade";
+      const T = Math.max(0, Number(transitionPlan[k - 1]?.duration_sec) || 0);
+      if (transition === "cut" || T <= 0) {
+        fc.push(`[${prev}][${k}:v]concat=n=2:v=1:a=0[${out}]`);
+        acc = acc + durs[k];
+      } else {
+        const off = Math.max(0, acc - T);
+        fc.push(`[${prev}][${k}:v]xfade=transition=${transition}:duration=${T.toFixed(3)}:offset=${off.toFixed(3)}[${out}]`);
+        acc = acc + durs[k] - T;
+      }
       prev = out;
     }
+    total = acc;
     last = prev;
   }
   if (logoIdx != null) {
@@ -268,7 +279,6 @@ async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, a
 
   // Explicit -t instead of -shortest: a voiceover shorter than the video must
   // not truncate it (music/silence covers the tail); longer audio gets cut here.
-  const total = durs.reduce((a, b) => a + b, 0) - T * (n - 1);
   const aout = buildAudioGraph(fc, { voiceIdx, musicIdx, total });
 
   if (fc.length) args.push("-filter_complex", fc.join(";"));
@@ -739,16 +749,22 @@ async function processVideoJob(p) {
       await runFfmpeg(a);
     }
 
-    // Cinematic: per-scene Ken-Burns clips joined with crossfades. Falls back to
+    // Cinematic: per-scene motion clips joined with restrained transitions. Falls back to
     // the simple path on any ffmpeg error so a render never fails outright.
-    let renderStyle = "cinematic";
+    let renderStyle = "scene_aware_cinematic";
+    let motionPlan = [];
+    let transitionPlan = [];
     try {
-      // Each crossfade overlaps adjacent clips by T, shortening the timeline by
-      // T*(n-1). Pad every clip except the last by T so the assembled video runs
-      // exactly the scene-sum duration — and each transition then starts exactly
-      // at the original scene boundary, keeping the ASS captions in sync.
-      const T = Math.min(0.6, Math.min(...durs) * 0.4); // transition < shortest clip
-      const clipDurs = durs.map((d, i) => (i < durs.length - 1 ? d + T : d));
+      motionPlan = planMotionTreatments(scenePaths);
+      transitionPlan = planTransitions(scenePaths).map((t, i) => ({
+        ...t,
+        duration_sec: transitionDuration(t.transition, Math.min(durs[i] || 0.6, durs[i + 1] || 0.6)),
+      }));
+      // Each transition overlaps adjacent clips by its duration, shortening the
+      // timeline by that amount. Pad the outgoing clip by its own transition
+      // duration so the assembled video still runs exactly the scene-sum
+      // duration and captions remain aligned to original scene boundaries.
+      const clipDurs = durs.map((d, i) => d + (transitionPlan[i]?.duration_sec || 0));
       const clips = [];
       for (let i = 0; i < scenePaths.length; i++) {
         const cp = join(dir, `clip-${i}.mp4`);
@@ -756,15 +772,15 @@ async function processVideoJob(p) {
           try {
             await stockClip(scenePaths[i].videoFile, cp, clipDurs[i], width, height);
           } catch (e) {
-            console.warn(`[job ${jobId}] scene ${scenePaths[i].idx} stock clip failed (${String(e?.message || e).slice(0, 120)}); Ken Burns fallback`);
-            await kenBurnsClip(scenePaths[i].file, cp, clipDurs[i], width, height);
+            console.warn(`[job ${jobId}] scene ${scenePaths[i].idx} stock clip failed (${String(e?.message || e).slice(0, 120)}); still-motion fallback`);
+            await stillMotionClip(scenePaths[i].file, cp, clipDurs[i], width, height, motionPlan[i]?.treatment);
           }
         } else {
-          await kenBurnsClip(scenePaths[i].file, cp, clipDurs[i], width, height);
+          await stillMotionClip(scenePaths[i].file, cp, clipDurs[i], width, height, motionPlan[i]?.treatment);
         }
         clips.push(cp);
       }
-      await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, musicPath, assPath, logoPath, T);
+      await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, musicPath, assPath, logoPath, transitionPlan);
     } catch (err) {
       console.warn(`[job ${jobId}] cinematic render failed (${String(err?.message || err).slice(0, 200)}); falling back to slideshow`);
       renderStyle = "slideshow_fallback";
@@ -840,6 +856,11 @@ async function processVideoJob(p) {
         voiceover_adjusted_sec: voiceMeta?.adjustedSec ?? null,
         voiceover_timing_adjusted: voiceMeta?.adjusted ?? false,
         voiceover_coverage_ratio: voiceMeta?.coverage ?? null,
+        still_motion: {
+          render_style: renderStyle,
+          treatments: motionPlan.slice(0, 12),
+          transitions: transitionPlan.slice(0, 12),
+        },
       },
     });
 

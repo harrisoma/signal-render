@@ -6,7 +6,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test quality-gates.test.js"
+    "test": "node --test *.test.js"
   },
   "engines": {
     "node": ">=20"
