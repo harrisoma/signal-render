@@ -136,6 +136,15 @@ function hasFfmpeg() {
   });
 }
 
+function boundedDiagnostic(value, max = 500) {
+  return String(value || "")
+    .replace(/[A-Za-z0-9_-]{24,}/g, "redacted")
+    .replace(/https?:\/\/\S+/g, "redacted-url")
+    .replace(/[A-Z]:\\[^\s]+/g, "redacted-path")
+    .replace(/\/(?:tmp|app)\/[^\s]+/g, "redacted-path")
+    .slice(0, max);
+}
+
 function ffmpegVersion() {
   return new Promise((resolve) => {
     const p = spawn(FFMPEG, ["-version"]);
@@ -246,22 +255,28 @@ async function xfadeAssemble(clips, durs, outPath, w, h, voicePath, musicPath, a
   if (logoPath) args.push("-i", logoPath);
 
   const fc = [];
-  let last = "0:v";
+  const norm = (label, out) => `${label}settb=AVTB,setpts=PTS-STARTPTS,fps=30,format=yuv420p[${out}]`;
+  const inputLabels = clips.map((_, i) => `v${i}n`);
+  clips.forEach((_, i) => fc.push(norm(`[${i}:v]`, inputLabels[i])));
+
+  let last = inputLabels[0] || "0:v";
   let total = durs[0] || 0;
   if (n > 1) {
-    let acc = durs[0], prev = "0:v";
+    let acc = durs[0], prev = inputLabels[0];
     for (let k = 1; k < n; k++) {
       const out = `vx${k}`;
+      const raw = `vr${k}`;
       const transition = normalizeTransitionIntent(transitionPlan[k - 1]?.transition) || "fade";
       const T = Math.max(0, Number(transitionPlan[k - 1]?.duration_sec) || 0);
       if (transition === "cut" || T <= 0) {
-        fc.push(`[${prev}][${k}:v]concat=n=2:v=1:a=0[${out}]`);
+        fc.push(`[${prev}][${inputLabels[k]}]concat=n=2:v=1:a=0[${raw}]`);
         acc = acc + durs[k];
       } else {
         const off = Math.max(0, acc - T);
-        fc.push(`[${prev}][${k}:v]xfade=transition=${transition}:duration=${T.toFixed(3)}:offset=${off.toFixed(3)}[${out}]`);
+        fc.push(`[${prev}][${inputLabels[k]}]xfade=transition=${transition}:duration=${T.toFixed(3)}:offset=${off.toFixed(3)}[${raw}]`);
         acc = acc + durs[k] - T;
       }
+      fc.push(norm(`[${raw}]`, out));
       prev = out;
     }
     total = acc;
@@ -751,9 +766,11 @@ async function processVideoJob(p) {
 
     // Cinematic: per-scene motion clips joined with restrained transitions. Falls back to
     // the simple path on any ffmpeg error so a render never fails outright.
-    let renderStyle = "scene_aware_cinematic";
+    const requestedRenderStyle = "scene_aware_cinematic";
+    let renderStyle = requestedRenderStyle;
     let motionPlan = [];
     let transitionPlan = [];
+    let cinematicFallback = null;
     try {
       motionPlan = planMotionTreatments(scenePaths);
       transitionPlan = planTransitions(scenePaths).map((t, i) => ({
@@ -782,8 +799,18 @@ async function processVideoJob(p) {
       }
       await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, musicPath, assPath, logoPath, transitionPlan);
     } catch (err) {
-      console.warn(`[job ${jobId}] cinematic render failed (${String(err?.message || err).slice(0, 200)}); falling back to slideshow`);
+      const reason = boundedDiagnostic(err?.message || err, 500);
+      console.warn(`[job ${jobId}] cinematic render failed (${reason.slice(0, 200)}); falling back to slideshow`);
       renderStyle = "slideshow_fallback";
+      cinematicFallback = {
+        requested_render_style: requestedRenderStyle,
+        actual_render_style: renderStyle,
+        fallback_occurred: true,
+        failure_stage: "cinematic_assembly",
+        failure_reason: reason,
+        motion_encoded: false,
+        transitions_encoded: false,
+      };
       await renderSimple();
     }
     console.log(`[job ${jobId}] render style: ${renderStyle}`);
@@ -857,7 +884,13 @@ async function processVideoJob(p) {
         voiceover_timing_adjusted: voiceMeta?.adjusted ?? false,
         voiceover_coverage_ratio: voiceMeta?.coverage ?? null,
         still_motion: {
+          requested_render_style: requestedRenderStyle,
           render_style: renderStyle,
+          actual_render_style: renderStyle,
+          fallback_occurred: Boolean(cinematicFallback),
+          motion_encoded: !cinematicFallback,
+          transitions_encoded: !cinematicFallback,
+          fallback: cinematicFallback,
           treatments: motionPlan.slice(0, 12),
           transitions: transitionPlan.slice(0, 12),
         },
