@@ -55,3 +55,43 @@ test("html render token comparison ignores surrounding whitespace", () => {
   assert.match(source, /process\.env\.RENDER_HTML_TOKEN \|\| ""\)\.trim\(\)/);
   assert.match(source, /req\.headers\["x-render-token"\] \|\| ""\)\.trim\(\)/);
 });
+
+test("Premium assembles supplied scene video clips", () => {
+  assert.match(source, /const isPremiumMotion = p\.premium_motion === true/);
+  assert.match(source, /s\.video_url && \(isPremiumMotion \|\| p\.render_style === "ugc"\)/);
+  assert.match(source, /premiumMotionClip\(s\.videoFile, cp/);
+  assert.match(source, /renderStyle = "premium_motion"/);
+  assert.match(source, /render_source: p\.render_source \|\| "railway"/);
+});
+
+test("Premium fails when required clips are missing and bypasses Standard motion", () => {
+  assert.match(source, /Premium motion clips missing for scene/);
+  assert.match(source, /if \(!isPremiumMotion\) try/);
+  assert.match(source, /else await stillMotionClip\(s\.file, cp, clipDurs\[i\], width, height, "hold"\)/);
+});
+
+test("Premium clip normalization does not use the still-motion renderer", () => {
+  assert.match(source, /async function premiumMotionClip\(videoSrc/);
+  assert.match(source, /-stream_loop.*-i", videoSrc/s);
+  assert.match(source, /tpad=stop_mode=clone/);
+});
+
+test("Premium metadata reports consumed scene clips", () => {
+  assert.match(source, /premium_motion: isPremiumMotion/);
+  assert.match(source, /premium_scene_count/);
+  assert.match(source, /premium_scene_indices/);
+});
+
+test("scene ordering remains explicit before assembly", () => {
+  assert.match(source, /const sorted = \[\.\.\.p\.scenes\]\.sort\(\(a, b\) => a\.idx - b\.idx\)/);
+  assert.match(source, /const scenePaths = \[\]/);
+  assert.match(source, /for \(let i = 0; i < scenePaths\.length; i\+\+\)/);
+});
+
+test("health endpoint and existing rendering gates remain present", () => {
+  assert.match(source, /app\.get\("\/health"/);
+  assert.match(source, /video_render/);
+  assert.match(source, /status_endpoint_configured/);
+  assert.match(source, /renderStyle = "slideshow_fallback"/);
+  assert.match(source, /final MP4 is missing the required audio stream/);
+});

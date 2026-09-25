@@ -211,6 +211,19 @@ async function stillMotionClip(img, outPath, durSec, w, h, treatment = "push_in"
   ]);
 }
 
+// Premium clips already contain generated motion. Normalize their framing and
+// duration only; missing Premium clips are rejected by the Premium assembly
+// branch instead of being replaced with still-image motion.
+async function premiumMotionClip(videoSrc, outPath, durSec, w, h) {
+  const vf = `[0:v]scale=${w}:${h}:force_original_aspect_ratio=increase:flags=bicubic,crop=${w}:${h},fps=30,` +
+    `tpad=stop_mode=clone:stop_duration=${durSec.toFixed(3)},trim=0:${durSec.toFixed(3)},setpts=PTS-STARTPTS,setsar=1,format=yuv420p[v]`;
+  await runFfmpeg([
+    "-y", "-stream_loop", "-1", "-i", videoSrc,
+    "-filter_complex", vf, "-map", "[v]", "-an", "-t", durSec.toFixed(3),
+    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "20", outPath,
+  ]);
+}
+
 // One clip from real stock footage: cover-crop to target, 30fps, freeze-pad the
 // last frame if the source runs short, hard-cap at the scene duration.
 async function stockClip(src, outPath, durSec, w, h) {
@@ -639,6 +652,7 @@ app.post("/render-video", auth, (req, res) => {
 
 async function processVideoJob(p) {
   const { job_id: jobId, project_id: projectId } = p;
+  const isPremiumMotion = p.premium_motion === true;
   jobs.set(jobId, { status: "rendering" });
   const started = Date.now();
   const dir = await mkdtemp(join(tmpdir(), `sig-${jobId}-`));
@@ -657,7 +671,12 @@ async function processVideoJob(p) {
       const file = join(dir, `scene-${s.idx}.jpg`);
       await writeFile(file, Buffer.from(await r.arrayBuffer()));
       let videoFile = null;
-      if (s.video_url) {
+      if (s.video_url && (isPremiumMotion || p.render_style === "ugc")) {
+        const vr = await fetchWithTimeout(s.video_url);
+        if (!vr.ok) throw new Error(`scene ${s.idx} generated motion clip download ${vr.status}`);
+        videoFile = join(dir, `scene-${s.idx}.mp4`);
+        await writeFile(videoFile, Buffer.from(await vr.arrayBuffer()));
+      } else if (s.video_url) {
         try {
           const vr = await fetchWithTimeout(s.video_url);
           if (vr.ok) { videoFile = join(dir, `scene-${s.idx}.mp4`); await writeFile(videoFile, Buffer.from(await vr.arrayBuffer())); }
@@ -771,7 +790,29 @@ async function processVideoJob(p) {
     let motionPlan = [];
     let transitionPlan = [];
     let cinematicFallback = null;
-    try {
+
+    // Premium: generated per-scene motion clips joined with crossfades. This
+    // branch has no slideshow fallback: a missing/broken clip must fail the
+    // Premium job rather than masquerade as Standard.
+    if (isPremiumMotion) {
+      await reportStatus(jobId, projectId, { progress: 40, current_step: "premium_motion_assemble" });
+      const missing = scenePaths.filter((s) => !s.videoFile && !s.endcard);
+      if (missing.length) throw new Error(`Premium motion clips missing for scene ${missing.map((s) => s.idx).join(", ")}`);
+      const T = Math.min(0.6, Math.min(...durs) * 0.4);
+      const clipDurs = durs.map((d, i) => (i < durs.length - 1 ? d + T : d));
+      const clips = [];
+      for (let i = 0; i < scenePaths.length; i++) {
+        const s = scenePaths[i];
+        const cp = join(dir, `premium-clip-${i}.mp4`);
+        if (s.videoFile) await premiumMotionClip(s.videoFile, cp, clipDurs[i], width, height);
+        else await stillMotionClip(s.file, cp, clipDurs[i], width, height, "hold"); // explicit end-card only
+        clips.push(cp);
+      }
+      await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, musicPath, assPath, logoPath, T);
+      renderStyle = "premium_motion";
+    }
+
+    if (!isPremiumMotion) try {
       motionPlan = planMotionTreatments(scenePaths);
       transitionPlan = planTransitions(scenePaths).map((t, i) => ({
         ...t,
@@ -859,7 +900,7 @@ async function processVideoJob(p) {
     await reportStatus(jobId, projectId, {
       status: "rendered",
       render_ms: Date.now() - started,
-      render_source: "railway",
+      render_source: p.render_source || "railway",
       duration_sec: durationSec,
       file_size_bytes: stV.size,
       output: {
@@ -883,6 +924,9 @@ async function processVideoJob(p) {
         voiceover_adjusted_sec: voiceMeta?.adjustedSec ?? null,
         voiceover_timing_adjusted: voiceMeta?.adjusted ?? false,
         voiceover_coverage_ratio: voiceMeta?.coverage ?? null,
+        premium_motion: isPremiumMotion,
+        premium_scene_count: isPremiumMotion ? scenePaths.filter((s) => Boolean(s.videoFile)).length : 0,
+        premium_scene_indices: isPremiumMotion ? scenePaths.filter((s) => Boolean(s.videoFile)).map((s) => s.idx) : [],
         still_motion: {
           requested_render_style: requestedRenderStyle,
           render_style: renderStyle,
