@@ -800,6 +800,7 @@ async function processVideoJob(p) {
       if (missing.length) throw new Error(`Premium motion clips missing for scene ${missing.map((s) => s.idx).join(", ")}`);
       const T = Math.min(0.6, Math.min(...durs) * 0.4);
       const clipDurs = durs.map((d, i) => (i < durs.length - 1 ? d + T : d));
+      const premiumTransitionPlan = scenePaths.slice(1).map(() => ({ transition: "fade", duration_sec: T }));
       const clips = [];
       for (let i = 0; i < scenePaths.length; i++) {
         const s = scenePaths[i];
@@ -808,7 +809,7 @@ async function processVideoJob(p) {
         else await stillMotionClip(s.file, cp, clipDurs[i], width, height, "hold"); // explicit end-card only
         clips.push(cp);
       }
-      await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, musicPath, assPath, logoPath, T);
+      await xfadeAssemble(clips, clipDurs, outPath, width, height, voicePath, musicPath, assPath, logoPath, premiumTransitionPlan);
       renderStyle = "premium_motion";
     }
 
